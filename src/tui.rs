@@ -109,8 +109,8 @@ impl Zoom {
 	// TODO: Make this configurable, maybe allow fractional steps?
 	// With fractional steps, it might also be a good idea to have these
 	// have the same ratio as the font aspect ratio.
-	const PAN_STEP_X: i16 = 2;
-	const PAN_STEP_Y: i16 = 1;
+	const PAN_STEP_X: i16 = 6;
+	const PAN_STEP_Y: i16 = 6;
 
 	fn pan(&mut self, direction: Direction) {
 		let (target, sign) = match direction {
@@ -753,10 +753,10 @@ impl Tui {
 							InputAction::Redraw
 						}),
 					KeyCode::Char(c) => match c {
-						'l' => self.change_page(PageChange::Next, ChangeAmount::Single),
-						'j' => self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
-						'h' => self.change_page(PageChange::Prev, ChangeAmount::Single),
-						'k' => self.change_page(PageChange::Prev, ChangeAmount::WholeScreen),
+						'L' => self.change_page(PageChange::Next, ChangeAmount::Single),
+						'J' => self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
+						'H' => self.change_page(PageChange::Prev, ChangeAmount::Single),
+						'K' => self.change_page(PageChange::Prev, ChangeAmount::WholeScreen),
 						'q' => Some(InputAction::QuitApp),
 						'g' => {
 							self.set_msg(MessageSetting::Some(BottomMessage::Input(
@@ -850,10 +850,14 @@ impl Tui {
 						}
 						'o' if can_zoom => self.update_zoom(Zoom::step_in),
 						'O' if can_zoom => self.update_zoom(Zoom::step_out),
-						'L' if can_zoom => self.update_zoom(|z| z.pan(Direction::Right)),
-						'H' if can_zoom => self.update_zoom(|z| z.pan(Direction::Left)),
-						'J' if can_zoom => self.update_zoom(|z| z.pan(Direction::Down)),
-						'K' if can_zoom => self.update_zoom(|z| z.pan(Direction::Up)),
+						'l' if can_zoom => self.update_zoom(|z| z.pan(Direction::Right)),
+						'h' if can_zoom => self.update_zoom(|z| z.pan(Direction::Left)),
+						'j' if can_zoom => self.update_zoom(|z| z.pan(Direction::Down)),
+						'k' if can_zoom => self.update_zoom(|z| z.pan(Direction::Up)),
+						'l' => self.change_page(PageChange::Next, ChangeAmount::Single),
+						'h' => self.change_page(PageChange::Prev, ChangeAmount::Single),
+						'j' => self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
+						'k' => self.change_page(PageChange::Prev, ChangeAmount::WholeScreen),
 						'G' if can_zoom => self.update_zoom(Zoom::pan_top),
 						'0' if can_zoom => self.update_zoom(Zoom::pan_left),
 						'$' if can_zoom => self.update_zoom(Zoom::pan_right),
@@ -1092,9 +1096,9 @@ impl Tui {
 }
 
 static HELP_PAGE: &str = "\
-l, h, left, right:
+L, H, left, right:
     Go forward/backwards a single page
-j, k, down, up:
+J, K, down, up:
     Go forwards/backwards a screen's worth of pages
 q, esc:
     Quit
@@ -1122,7 +1126,7 @@ o/O (when on fill-screen):
     Zoom in and out, respectively
 gg/G (when on fill-screen):
     Scroll to top/bottom of page
-H, J, K, L (when zoomed in):
+h, j, k, l (when zoomed in):
     Pan direction around page
 0/$ (when on fill-screen):
     Scroll to left/right side of page
