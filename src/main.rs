@@ -64,6 +64,11 @@ impl std::error::Error for WrappedErr {}
 
 fn reset_term() {
 	_ = disable_raw_mode();
+	if tdf::kitty::is_tmux() {
+		let mut out = std::io::stdout().lock();
+		_ = out.write_all(b"\x1bPtmux;\x1b\x1b_Ga=d,d=A,q=2\x1b\x1b\\\x1b\\");
+		_ = out.flush();
+	}
 	_ = execute!(
 		std::io::stdout(),
 		LeaveAlternateScreen,

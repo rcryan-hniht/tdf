@@ -82,7 +82,8 @@ struct Zoom {
 	cell_pan_from_left: u16,
 	// how many terminal-cells worth of content overflow the top side of the screen (and are thus
 	// not displayed)
-	cell_pan_from_top: u16
+	cell_pan_from_top: u16,
+	max_pan_top: u16
 }
 impl Zoom {
 	/// Returns the zoom factor, where 1 is the default and means fill-screen
@@ -352,12 +353,12 @@ impl Tui {
 		let width = (img_section_w * f32::from(font_size.width)) as u32;
 		let height = (img_section_h * f32::from(font_size.height)) as u32;
 
+		let max_pan_top = img_cell_h.saturating_sub(img_section_h.ceil() as u16);
 		zoom.cell_pan_from_left = zoom
 			.cell_pan_from_left
 			.min(img_cell_w.saturating_sub(img_section_w.ceil() as u16));
-		zoom.cell_pan_from_top = zoom
-			.cell_pan_from_top
-			.min(img_cell_h.saturating_sub(img_section_h.ceil() as u16));
+		zoom.cell_pan_from_top = zoom.cell_pan_from_top.min(max_pan_top);
+		zoom.max_pan_top = max_pan_top;
 
 		KittyDisplay::DisplayImages(vec![KittyReadyToDisplay {
 			img,
@@ -579,9 +580,22 @@ impl Tui {
 
 		let old = self.page;
 		match change {
-			PageChange::Next =>
-				self.set_page((self.page + diff).min(self.rendered.len().saturating_sub(1))),
-			PageChange::Prev => self.set_page(self.page.saturating_sub(diff))
+			PageChange::Next => {
+				self.set_page((self.page + diff).min(self.rendered.len().saturating_sub(1)));
+				if self.page != old
+					&& let Some(zoom) = &mut self.zoom
+				{
+					zoom.cell_pan_from_top = 0;
+				}
+			}
+			PageChange::Prev => {
+				self.set_page(self.page.saturating_sub(diff));
+				if self.page != old
+					&& let Some(zoom) = &mut self.zoom
+				{
+					zoom.cell_pan_from_top = u16::MAX;
+				}
+			}
 		}
 
 		// Yes these conversions could wrap around if you have > isize::MAX pages, but we already
@@ -852,8 +866,21 @@ impl Tui {
 						'O' if can_zoom => self.update_zoom(Zoom::step_out),
 						'l' if can_zoom => self.update_zoom(|z| z.pan(Direction::Right)),
 						'h' if can_zoom => self.update_zoom(|z| z.pan(Direction::Left)),
-						'j' if can_zoom => self.update_zoom(|z| z.pan(Direction::Down)),
-						'k' if can_zoom => self.update_zoom(|z| z.pan(Direction::Up)),
+						'j' if can_zoom =>
+							if self
+								.zoom
+								.is_some_and(|z| z.cell_pan_from_top >= z.max_pan_top)
+							{
+								self.change_page(PageChange::Next, ChangeAmount::WholeScreen)
+							} else {
+								self.update_zoom(|z| z.pan(Direction::Down))
+							},
+						'k' if can_zoom =>
+							if self.zoom.is_some_and(|z| z.cell_pan_from_top == 0) {
+								self.change_page(PageChange::Prev, ChangeAmount::WholeScreen)
+							} else {
+								self.update_zoom(|z| z.pan(Direction::Up))
+							},
 						'l' => self.change_page(PageChange::Next, ChangeAmount::Single),
 						'h' => self.change_page(PageChange::Prev, ChangeAmount::Single),
 						'j' => self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
@@ -1005,6 +1032,11 @@ impl Tui {
 			// mark that we need to re-render the images
 			self.last_render.rect = Rect::default();
 			self.page = page;
+			if let Some(zoom) = &mut self.zoom {
+				zoom.cell_pan_from_top = 0;
+				zoom.cell_pan_from_left = 0;
+				zoom.max_pan_top = u16::MAX;
+			}
 		}
 	}
 

@@ -62,19 +62,41 @@ impl<W: Write> Write for DbgWriter<W> {
 	}
 }
 
+pub fn is_tmux() -> bool {
+	static IS_TMUX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+	*IS_TMUX.get_or_init(|| {
+		std::env::var_os("TMUX").is_some()
+			|| std::env::var("TERM_PROGRAM").is_ok_and(|p| p == "tmux")
+			|| std::env::var("TERM").is_ok_and(|t| t.starts_with("tmux"))
+	})
+}
+
 pub async fn run_action<'es>(
 	action: Action<'_, '_>,
 	ev_stream: &'es mut EventStream
 ) -> Result<Option<ImageId>, TransmitError<<&'es mut EventStream as AsyncInputReader>::Error>> {
-	let writer = DbgWriter {
-		w: std::io::stdout().lock(),
-		#[cfg(debug_assertions)]
-		buf: String::new()
-	};
-	action
-		.execute_async(writer, ev_stream)
-		.await
-		.map(|(_, i)| i)
+	let stdout = std::io::stdout().lock();
+	if is_tmux() {
+		let writer = DbgWriter {
+			w: kittage::tmux::TmuxWriter::new(stdout),
+			#[cfg(debug_assertions)]
+			buf: String::new()
+		};
+		action
+			.execute_async(writer, ev_stream)
+			.await
+			.map(|(_, i)| i)
+	} else {
+		let writer = DbgWriter {
+			w: stdout,
+			#[cfg(debug_assertions)]
+			buf: String::new()
+		};
+		action
+			.execute_async(writer, ev_stream)
+			.await
+			.map(|(_, i)| i)
+	}
 }
 
 pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
@@ -176,7 +198,14 @@ pub async fn display_kitty_images<'es>(
 			..DisplayConfig::default()
 		};
 
-		execute!(std::io::stdout(), MoveTo(pos.x, pos.y)).unwrap();
+		if is_tmux() {
+			let mut out = std::io::stdout().lock();
+			execute!(out, MoveTo(pos.x, pos.y)).unwrap();
+			out.write_all(b"\x1b[0m\x1b[X").unwrap();
+			out.flush().unwrap();
+		} else {
+			execute!(std::io::stdout(), MoveTo(pos.x, pos.y)).unwrap();
+		}
 
 		log::debug!("going to display img {img:#?}");
 		log::debug!("displaying with config {config:#?}");
@@ -242,21 +271,23 @@ pub async fn display_kitty_images<'es>(
 	let z_idxes_to_remove = *last_z_index;
 	*last_z_index = new_z_index;
 
+	let clear_res = run_action(
+		Action::Delete(DeleteConfig {
+			effect: ClearOrDelete::Clear,
+			which: WhichToDelete::PlacementsWithZIndex(z_idxes_to_remove)
+		}),
+		ev_stream
+	)
+	.await;
+
 	match err {
 		Err((failed_pages, source)) => Err(DisplayErr {
 			failed_pages,
 			user_facing_err: "Couldn't transfer image to the terminal",
 			source
 		}),
-		Ok(()) => run_action(
-			Action::Delete(DeleteConfig {
-				effect: ClearOrDelete::Clear,
-				which: WhichToDelete::PlacementsWithZIndex(z_idxes_to_remove)
-			}),
-			ev_stream
-		)
-		.await
-		.map_err(|e| DisplayErr::empty("Couldn't clear previously-sent images", e))
-		.map(|_| ())
+		Ok(()) => clear_res
+			.map_err(|e| DisplayErr::empty("Couldn't clear previously-sent images", e))
+			.map(|_| ())
 	}
 }
