@@ -508,10 +508,18 @@ async fn enter_redraw_loop(
 					))))
 				}
 
-				for page_num in failed_pages {
-					tui.page_failed_display(page_num);
-					// So that they get re-rendered and sent over again
-					to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
+				// Never re-queue pages when reading the terminal reply fails/times out (e.g. when
+				// tmux routes the reply to another pane after a rapid focus switch), otherwise each
+				// timeout restarts a re-render/re-transmit loop.
+				if !matches!(
+					source,
+					DisplayErrSource::Transmission(TransmitError::ReadingInput(_))
+				) {
+					for page_num in failed_pages {
+						tui.page_failed_display(page_num);
+						// So that they get re-rendered and sent over again
+						to_renderer.send(RenderNotif::PageNeedsReRender(page_num))?;
+					}
 				}
 			}
 
