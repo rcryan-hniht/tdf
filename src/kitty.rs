@@ -129,22 +129,106 @@ pub fn is_tmux() -> bool {
 	})
 }
 
-fn is_tmux_pane_focused() -> bool {
-	if !is_tmux() {
-		return true;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TmuxPaneState {
+	Focused,
+	VisibleUnfocused,
+	Hidden
+}
+
+#[must_use]
+pub fn parse_tmux_pane_state(text: &str) -> TmuxPaneState {
+	let mut cols = text.split_whitespace();
+	let attached = cols.next() == Some("1");
+	let win_active = cols.next() == Some("1");
+	let pane_active = cols.next() == Some("1");
+	let zoomed = cols.next() == Some("1");
+	let in_mode = cols.next() == Some("1");
+
+	if !attached || !win_active || in_mode || (zoomed && !pane_active) {
+		TmuxPaneState::Hidden
+	} else if pane_active {
+		TmuxPaneState::Focused
+	} else {
+		TmuxPaneState::VisibleUnfocused
 	}
-	let Some(pane) = std::env::var_os("TMUX_PANE").filter(|p| !p.is_empty()) else {
-		return false;
+}
+
+#[must_use]
+pub fn parse_tmux_cell_size(text: &str) -> Option<(u16, u16)> {
+	let mut cols = text.split_whitespace();
+	let w = cols.next()?.parse::<u16>().ok().filter(|&v| v > 0)?;
+	let h = cols.next()?.parse::<u16>().ok().filter(|&v| v > 0)?;
+	Some((w, h))
+}
+
+fn tmux_display_message(format: &str) -> Option<String> {
+	if !is_tmux() {
+		return None;
+	}
+	let mut cmd = std::process::Command::new("tmux");
+	cmd.args(["display-message", "-p"]);
+	if let Some(pane) = std::env::var_os("TMUX_PANE").filter(|p| !p.is_empty()) {
+		cmd.arg("-t").arg(pane);
+	}
+	let out = cmd.arg(format).output().ok()?;
+	if !out.status.success() {
+		return None;
+	}
+	std::str::from_utf8(&out.stdout).ok().map(str::to_owned)
+}
+
+#[must_use]
+pub fn tmux_client_cell_size() -> Option<(u16, u16)> {
+	let text = tmux_display_message("#{client_cell_width} #{client_cell_height}")?;
+	parse_tmux_cell_size(&text)
+}
+
+/// Overrides any pane-local `allow-passthrough on` (e.g. set by `ratatui_image::Picker`) with
+/// `all` so `tdf` can still clear Kitty placements after switching to another tmux window.
+pub fn ensure_tmux_passthrough_all() {
+	if !is_tmux() {
+		return;
+	}
+	let mut cmd = std::process::Command::new("tmux");
+	cmd.args(["set-option", "-p"]);
+	if let Some(pane) = std::env::var_os("TMUX_PANE").filter(|p| !p.is_empty()) {
+		cmd.arg("-t").arg(pane);
+	}
+	let _ = cmd
+		.args(["allow-passthrough", "all"])
+		.stdin(std::process::Stdio::null())
+		.stdout(std::process::Stdio::null())
+		.stderr(std::process::Stdio::null())
+		.status();
+}
+
+#[must_use]
+pub fn tmux_pane_state() -> TmuxPaneState {
+	if !is_tmux() {
+		return TmuxPaneState::Focused;
+	}
+	if std::env::var_os("TMUX_PANE").is_none_or(|p| p.is_empty()) {
+		return TmuxPaneState::Hidden;
+	}
+	let Some(text) = tmux_display_message(
+		"#{session_attached} #{window_active} #{pane_active} #{window_zoomed_flag} #{pane_in_mode}"
+	) else {
+		return TmuxPaneState::Hidden;
 	};
-	let Ok(out) = std::process::Command::new("tmux")
-		.args(["display-message", "-p", "-t"])
-		.arg(pane)
-		.arg("#{&&:#{session_attached},#{&&:#{window_active},#{&&:#{pane_active},#{!:#{pane_in_mode}}}}}")
-		.output()
-	else {
-		return false;
-	};
-	out.status.success() && std::str::from_utf8(&out.stdout).is_ok_and(|s| s.trim() == "1")
+	parse_tmux_pane_state(&text)
+}
+
+fn is_tmux_pane_focused() -> bool {
+	tmux_pane_state() == TmuxPaneState::Focused
+}
+
+pub fn clear_kitty_placements_silent() {
+	let action = Action::Delete(DeleteConfig {
+		effect: ClearOrDelete::Clear,
+		which: WhichToDelete::All
+	});
+	let _ = write_silent_action::<std::io::Error>(&action);
 }
 
 fn transmit_silent<W: Write, E: std::error::Error>(
@@ -252,11 +336,13 @@ pub async fn do_shms_work(ev_stream: &mut EventStream) -> bool {
 	// apparently the terminal won't respond to queries unless they have an Id instead of a number
 	k_img.num_or_id = NumberOrId::Id(NonZeroU32::new(u32::MAX).unwrap());
 
-	enable_raw_mode().unwrap();
+	if enable_raw_mode().is_err() {
+		return false;
+	}
 
 	let res = run_action(Action::Query(&k_img), ev_stream).await;
 
-	disable_raw_mode().unwrap();
+	let _ = disable_raw_mode();
 
 	res.is_ok()
 }
@@ -339,11 +425,20 @@ pub async fn display_kitty_images<'es>(
 
 		if is_tmux() {
 			let mut out = std::io::stdout().lock();
-			execute!(out, MoveTo(pos.x, pos.y)).unwrap();
-			out.write_all(b"\x1b[0m\x1b[X").unwrap();
-			out.flush().unwrap();
-		} else {
-			execute!(std::io::stdout(), MoveTo(pos.x, pos.y)).unwrap();
+			if let Err(e) = execute!(out, MoveTo(pos.x, pos.y))
+				.and_then(|()| out.write_all(b"\x1b[0m\x1b[X"))
+				.and_then(|()| out.flush())
+			{
+				return Err(DisplayErr::empty(
+					"Couldn't position cursor for image",
+					TransmitError::Writing(e)
+				));
+			}
+		} else if let Err(e) = execute!(std::io::stdout(), MoveTo(pos.x, pos.y)) {
+			return Err(DisplayErr::empty(
+				"Couldn't position cursor for image",
+				TransmitError::Writing(e)
+			));
 		}
 
 		log::debug!("going to display img {img:#?}");
@@ -497,5 +592,29 @@ mod tests {
 		patcher.write_all(b"\x1b_Ga=T,q=2,i=82;AAAA\x1b\\").unwrap();
 		patcher.flush().unwrap();
 		assert_eq!(passthrough, b"\x1b_Ga=T,q=2,i=82;AAAA\x1b\\");
+	}
+
+	#[test]
+	fn parse_tmux_pane_state_classifies_focus_visible_and_hidden() {
+		assert_eq!(parse_tmux_pane_state("1 1 1 0 0\n"), TmuxPaneState::Focused);
+		assert_eq!(parse_tmux_pane_state("1 1 1 1 0\n"), TmuxPaneState::Focused);
+		assert_eq!(
+			parse_tmux_pane_state("1 1 0 0 0\n"),
+			TmuxPaneState::VisibleUnfocused
+		);
+		assert_eq!(parse_tmux_pane_state("1 1 0 1 0\n"), TmuxPaneState::Hidden);
+		assert_eq!(parse_tmux_pane_state("1 0 1 0 0\n"), TmuxPaneState::Hidden);
+		assert_eq!(parse_tmux_pane_state("0 1 1 0 0\n"), TmuxPaneState::Hidden);
+		assert_eq!(parse_tmux_pane_state("1 1 1 0 1\n"), TmuxPaneState::Hidden);
+		assert_eq!(parse_tmux_pane_state(""), TmuxPaneState::Hidden);
+	}
+
+	#[test]
+	fn parse_tmux_cell_size_parses_positive_dimensions() {
+		assert_eq!(parse_tmux_cell_size("12 25\n"), Some((12, 25)));
+		assert_eq!(parse_tmux_cell_size("0 25\n"), None);
+		assert_eq!(parse_tmux_cell_size("12 0\n"), None);
+		assert_eq!(parse_tmux_cell_size("12\n"), None);
+		assert_eq!(parse_tmux_cell_size(""), None);
 	}
 }

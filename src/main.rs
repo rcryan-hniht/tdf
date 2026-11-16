@@ -13,7 +13,7 @@ use std::{
 };
 
 use crossterm::{
-	event::EventStream,
+	event::{DisableFocusChange, EnableFocusChange, Event as CrosstermEvent, EventStream},
 	execute,
 	terminal::{
 		EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -39,7 +39,9 @@ use tdf::{
 	PrerenderLimit,
 	converter::{ConvertedPage, ConverterMsg, run_conversion_loop},
 	kitty::{
-		DisplayErr, DisplayErrSource, KittyDisplay, display_kitty_images, do_shms_work, run_action
+		DisplayErr, DisplayErrSource, KittyDisplay, TmuxPaneState, clear_kitty_placements_silent,
+		display_kitty_images, do_shms_work, ensure_tmux_passthrough_all, is_tmux, run_action,
+		tmux_client_cell_size, tmux_pane_state
 	},
 	renderer::{self, MUPDF_BLACK, MUPDF_WHITE, RenderError, RenderInfo, RenderNotif},
 	tui::{BottomMessage, InputAction, MessageSetting, Tui}
@@ -73,13 +75,15 @@ fn reset_term() {
 		std::io::stdout(),
 		LeaveAlternateScreen,
 		crossterm::cursor::Show,
-		crossterm::event::DisableMouseCapture
+		crossterm::event::DisableMouseCapture,
+		DisableFocusChange
 	);
 }
 
 fn main() -> Result<(), WrappedErr> {
 	let rt = tokio::runtime::Builder::new_multi_thread()
 		.worker_threads(3)
+		.enable_io()
 		.enable_time()
 		.build()
 		.unwrap();
@@ -92,10 +96,18 @@ fn main() -> Result<(), WrappedErr> {
 }
 
 async fn inner_main() -> Result<(), WrappedErr> {
+	#[cfg(unix)]
+	let mut usr1_sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+		.map_err(|e| WrappedErr(format!("Can't install SIGUSR1 handler: {e}").into()))?;
+	#[cfg(not(unix))]
+	let mut usr1_sig = ();
+
 	let hook = std::panic::take_hook();
 	std::panic::set_hook(Box::new(move |info| {
-		reset_term();
-		hook(info);
+		if std::thread::current().name() != Some("tdf-renderer") {
+			reset_term();
+			hook(info);
+		}
 	}));
 
 	#[cfg(feature = "tracing")]
@@ -115,7 +127,7 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		/// Defaults to 50ms.
 		optional --reload-delay reload_delay: u64
 		/// The number of pages to prerender surrounding the currently-shown page; 0 means no
-		/// limit. By default, there is no limit.
+		/// limit. Defaults to 25.
 		optional -p,--prerender prerender: usize
 		/// Custom white color, specified in css format (e.g. "FFFFFF" or "rgb(255, 255, 255)")
 		optional -w,--white-color white: String
@@ -237,25 +249,12 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		)
 		.map_err(|e| WrappedErr(format!("Can't watch the provided file: {e}").into()))?;
 
-	let mut window_size = window_size().map_err(|e| {
-		WrappedErr(format!("Can't get your current terminal window size: {e}").into())
-	})?;
-
-	if window_size.width == 0 || window_size.height == 0 {
-		let (w, h) = get_font_size_through_stdio()?;
-
-		window_size.width = w;
-		window_size.height = h;
-	}
-
-	let cell_height_px = window_size.height / window_size.rows;
-	let cell_width_px = window_size.width / window_size.columns;
-
 	execute!(
 		std::io::stdout(),
 		EnterAlternateScreen,
 		crossterm::cursor::Hide,
-		crossterm::event::EnableMouseCapture
+		crossterm::event::EnableMouseCapture,
+		EnableFocusChange
 	)
 	.map_err(|e| {
 		WrappedErr(
@@ -267,68 +266,69 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	})?;
 
 	// We need to create `picker` on this thread because if we create it on the `renderer` thread,
-	// it messes up something with user input. Input never makes it to the crossterm thing
-	let picker = Picker::from_query_stdio()
-		.or_else(|e| match e {
-			ratatui_image::errors::Errors::NoFontSize if
-				window_size.width != 0
-				&& window_size.height != 0
-				&& window_size.columns != 0
-				&& window_size.rows != 0 =>
-			{
-				// the 'equivalent' that is suggested instead is not the same. We need to keep
-				// calling this.
-				#[expect(deprecated)]
-				Ok(Picker::from_fontsize(FontSize { width: cell_width_px, height: cell_height_px }))
-			},
-			ratatui_image::errors::Errors::NoFontSize => Err(WrappedErr(
-				"Unable to detect your terminal's font size; this is an issue with your terminal emulator.\nPlease use a different terminal emulator or report this bug to tdf.".into()
-			)),
-			e => Err(WrappedErr(format!("Couldn't get the necessary information to set up images: {e}").into()))
-		})?;
+	// it messes up something with user input. Input never makes it to the crossterm thing.
+	// Query it before spawning `tdf-renderer` so renderer, converter, and TUI share the exact same cell size.
+	let picker = Picker::from_query_stdio().unwrap_or_else(|_| {
+		#[expect(deprecated)]
+		Picker::from_fontsize(resolve_fallback_font_size())
+	});
+
+	let mut font_size = picker.font_size();
+	font_size.width = font_size.width.max(1);
+	font_size.height = font_size.height.max(1);
+
+	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
+	if is_kitty {
+		ensure_tmux_passthrough_all();
+	}
+
+	let file_name = path.file_name().map_or_else(
+		|| "Unknown file".into(),
+		|n| n.to_string_lossy().to_string()
+	);
+	let tui = Tui::new(file_name, path.clone(), flags.max_wide, flags.r_to_l, is_kitty);
+	let startup = tui.startup_sync();
 
 	// then we want to spawn off the rendering task
 	// We need to use the thread::spawn API so that this exists in a thread not owned by tokio,
 	// since the methods we call in `start_rendering` will panic if called in an async context
-	let prerender = flags
-		.prerender
-		.and_then(NonZeroUsize::new)
-		.map_or(PrerenderLimit::All, PrerenderLimit::Limited);
+	let prerender = match flags.prerender {
+		None => PrerenderLimit::Limited(NonZeroUsize::new(25).unwrap()),
+		Some(0) => PrerenderLimit::All,
+		Some(n) => PrerenderLimit::Limited(NonZeroUsize::new(n).unwrap())
+	};
 
 	let file_path = path.clone();
-	std::thread::spawn(move || {
-		renderer::start_rendering(
-			&file_path,
-			render_tx,
-			render_rx,
-			cell_height_px,
-			cell_width_px,
-			prerender,
-			black,
-			white
-		)
-	});
-
-	let font_size = picker.font_size();
+	std::thread::Builder::new()
+		.name("tdf-renderer".to_string())
+		.spawn(move || {
+			renderer::start_rendering(
+				&file_path,
+				render_tx,
+				render_rx,
+				font_size.height,
+				font_size.width,
+				prerender,
+				black,
+				white,
+				startup.page,
+				startup.invert,
+				startup.rotate_steps,
+				startup.fit_or_fill
+			)
+		})
+		.map_err(|e| WrappedErr(format!("Failed to spawn renderer thread: {e}").into()))?;
 
 	let mut ev_stream = crossterm::event::EventStream::new();
 
 	let (to_converter, from_main) = flume::unbounded();
 	let (to_main, from_converter) = flume::unbounded();
 
-	let is_kitty = picker.protocol_type() == ProtocolType::Kitty;
-
 	let shms_work = is_kitty && do_shms_work(&mut ev_stream).await;
 
 	tokio::spawn(run_conversion_loop(
 		to_main, from_main, picker, 20, shms_work
 	));
-
-	let file_name = path.file_name().map_or_else(
-		|| "Unknown file".into(),
-		|n| n.to_string_lossy().to_string()
-	);
-	let tui = Tui::new(file_name, flags.max_wide, flags.r_to_l, is_kitty);
 
 	let backend = CrosstermBackend::new(std::io::stdout());
 	let mut term = Terminal::new(backend).map_err(|e| {
@@ -365,6 +365,9 @@ async fn inner_main() -> Result<(), WrappedErr> {
 				format!("Couldn't inform the rendering thread of the available area: {e}").into()
 			)
 		})?;
+	if startup.page > 0 {
+		let _ = to_converter.send(ConverterMsg::GoToPage(startup.page));
+	}
 
 	let tui_rx = tui_rx.into_stream();
 	let from_converter = from_converter.into_stream();
@@ -376,10 +379,12 @@ async fn inner_main() -> Result<(), WrappedErr> {
 		to_converter,
 		from_converter,
 		fullscreen,
+		is_kitty,
 		tui,
 		&mut term,
 		main_area,
-		font_size
+		font_size,
+		&mut usr1_sig
 	)
 	.await
 	.map_err(|e| {
@@ -395,6 +400,62 @@ async fn inner_main() -> Result<(), WrappedErr> {
 	Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxVisibilityAction {
+	None,
+	ClearAndDefer,
+	Restore
+}
+
+fn decide_tmux_visibility_action(
+	state: TmuxPaneState,
+	kitty_images_on_screen: bool,
+	pending_kitty_display: bool
+) -> TmuxVisibilityAction {
+	match state {
+		TmuxPaneState::Hidden if kitty_images_on_screen => TmuxVisibilityAction::ClearAndDefer,
+		TmuxPaneState::Focused | TmuxPaneState::VisibleUnfocused if pending_kitty_display => {
+			TmuxVisibilityAction::Restore
+		}
+		_ => TmuxVisibilityAction::None
+	}
+}
+
+fn sync_tmux_kitty_visibility(
+	tui: &mut Tui,
+	kitty_images_on_screen: &mut bool,
+	pending_kitty_display: &mut bool
+) -> bool {
+	match decide_tmux_visibility_action(
+		tmux_pane_state(),
+		*kitty_images_on_screen,
+		*pending_kitty_display
+	) {
+		TmuxVisibilityAction::ClearAndDefer => {
+			clear_kitty_placements_silent();
+			*kitty_images_on_screen = false;
+			*pending_kitty_display = true;
+			tui.invalidate_render();
+			false
+		}
+		TmuxVisibilityAction::Restore => {
+			tui.invalidate_render();
+			true
+		}
+		TmuxVisibilityAction::None => false
+	}
+}
+
+#[cfg(unix)]
+async fn recv_usr1(sig: &mut tokio::signal::unix::Signal) -> Option<()> {
+	sig.recv().await
+}
+
+#[cfg(not(unix))]
+async fn recv_usr1(_sig: &mut ()) -> Option<()> {
+	std::future::pending().await
+}
+
 // oh shut up clippy who cares
 #[expect(clippy::too_many_arguments)]
 async fn enter_redraw_loop(
@@ -404,12 +465,20 @@ async fn enter_redraw_loop(
 	to_converter: Sender<ConverterMsg>,
 	mut from_converter: RecvStream<'_, Result<ConvertedPage, RenderError>>,
 	mut fullscreen: bool,
+	is_kitty: bool,
 	mut tui: Tui,
 	term: &mut Terminal<CrosstermBackend<Stdout>>,
 	mut main_area: tdf::tui::RenderLayout,
-	font_size: FontSize
+	font_size: FontSize,
+	#[cfg(unix)] usr1_sig: &mut tokio::signal::unix::Signal,
+	#[cfg(not(unix))] usr1_sig: &mut ()
 ) -> Result<(), Box<dyn Error>> {
 	let mut kitty_z_idx = i32::MIN;
+	let use_tmux_kitty_guard = is_kitty && is_tmux();
+	let mut kitty_images_on_screen = false;
+	let mut pending_kitty_display = false;
+	let mut vis_tick = tokio::time::interval(Duration::from_millis(350));
+	vis_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
 	loop {
 		let mut needs_redraw = true;
@@ -417,27 +486,71 @@ async fn enter_redraw_loop(
 		tokio::select! {
 			// First we check if we have any keystrokes
 			Some(ev) = next_ev => {
-				// If we can't get user input, just crash.
-				let ev = ev.expect("Couldn't get any user input");
+				let Ok(ev) = ev else {
+					tui.save_state();
+					return Ok(());
+				};
 
-				match tui.handle_event(&ev) {
-					None => needs_redraw = false,
-					Some(action) => match action {
-						InputAction::Redraw => (),
-						InputAction::QuitApp => return Ok(()),
-						InputAction::JumpingToPage(page) => {
-							to_renderer.send(RenderNotif::JumpToPage(page))?;
-							to_converter.send(ConverterMsg::GoToPage(page))?;
-						},
-						InputAction::Search(term) => to_renderer.send(RenderNotif::Search(term))?,
-						InputAction::Invert => to_renderer.send(RenderNotif::Invert)?,
-						InputAction::Rotate => to_renderer.send(RenderNotif::Rotate)?,
-						InputAction::Fullscreen => fullscreen = !fullscreen,
-						InputAction::SwitchRenderZoom(f_or_f) => {
-							to_renderer.send(RenderNotif::SwitchFitOrFill(f_or_f)).unwrap();
+				match ev {
+					CrosstermEvent::FocusLost => {
+						needs_redraw = if use_tmux_kitty_guard {
+							sync_tmux_kitty_visibility(
+								&mut tui,
+								&mut kitty_images_on_screen,
+								&mut pending_kitty_display
+							)
+						} else {
+							false
+						};
+					}
+					CrosstermEvent::FocusGained => {
+						if use_tmux_kitty_guard && pending_kitty_display {
+							tui.invalidate_render();
+							needs_redraw = true;
+						} else {
+							needs_redraw = false;
+						}
+					}
+					_ => match tui.handle_event(&ev) {
+						None => needs_redraw = false,
+						Some(action) => match action {
+							InputAction::Redraw => (),
+							InputAction::QuitApp => {
+								tui.save_state();
+								return Ok(());
+							},
+							InputAction::JumpingToPage(page) => {
+								to_renderer.send(RenderNotif::JumpToPage(page))?;
+								to_converter.send(ConverterMsg::GoToPage(page))?;
+							},
+							InputAction::Search(term) => to_renderer.send(RenderNotif::Search(term))?,
+							InputAction::Invert => to_renderer.send(RenderNotif::Invert)?,
+							InputAction::Rotate => to_renderer.send(RenderNotif::Rotate)?,
+							InputAction::Reload => to_renderer.send(RenderNotif::Reload)?,
+							InputAction::Fullscreen => fullscreen = !fullscreen,
+							InputAction::SwitchRenderZoom(f_or_f) => {
+								to_renderer.send(RenderNotif::SwitchFitOrFill(f_or_f))?;
+							},
+							InputAction::ExtractPageText { page, open_visual } => {
+								to_renderer.send(RenderNotif::ExtractPageText { page, open_visual })?;
+							}
 						}
 					}
 				}
+			},
+			Some(()) = recv_usr1(usr1_sig), if use_tmux_kitty_guard => {
+				needs_redraw = sync_tmux_kitty_visibility(
+					&mut tui,
+					&mut kitty_images_on_screen,
+					&mut pending_kitty_display
+				);
+			},
+			_ = vis_tick.tick(), if use_tmux_kitty_guard && (kitty_images_on_screen || pending_kitty_display) => {
+				needs_redraw = sync_tmux_kitty_visibility(
+					&mut tui,
+					&mut kitty_images_on_screen,
+					&mut pending_kitty_display
+				);
 			},
 			Some(renderer_msg) = tui_rx.next() => {
 				match renderer_msg {
@@ -453,6 +566,12 @@ async fn enter_redraw_loop(
 						RenderInfo::Reloaded => tui.set_msg(MessageSetting::Some(BottomMessage::Reloaded)),
 						RenderInfo::SearchResults { page_num, num_results } =>
 							tui.got_num_results_on_page(page_num, num_results),
+						RenderInfo::DocMetadata { outlines, info } =>
+							tui.set_doc_metadata(outlines, info),
+						RenderInfo::PageLinks { page_num, links } =>
+							tui.set_page_links(page_num, links),
+						RenderInfo::PageText { page_num, text, open_visual } =>
+							tui.got_page_text(page_num, text, open_visual),
 					},
 					Err(e) => tui.show_error(e),
 				}
@@ -461,6 +580,9 @@ async fn enter_redraw_loop(
 				match img_res {
 					Ok(ConvertedPage { page, num, num_results }) => {
 						tui.page_ready(page, num, num_results);
+						while let Some(dropped_page) = tui.evict_far_page() {
+							to_renderer.send(RenderNotif::PageDropped(dropped_page))?;
+						}
 						if num == tui.page {
 							needs_redraw = true;
 						}
@@ -470,9 +592,11 @@ async fn enter_redraw_loop(
 			},
 		};
 
+		let _ = term.autoresize();
 		let new_area = Tui::main_layout(&term.get_frame(), fullscreen);
 		if new_area != main_area {
 			main_area = new_area;
+			tui.invalidate_render();
 			to_renderer.send(RenderNotif::Area(main_area.page_area))?;
 			needs_redraw = true;
 		}
@@ -482,6 +606,31 @@ async fn enter_redraw_loop(
 			term.draw(|f| {
 				to_display = tui.render(f, &main_area, font_size);
 			})?;
+
+			if use_tmux_kitty_guard {
+				let pane_state = tmux_pane_state();
+				if matches!(to_display, KittyDisplay::DisplayImages(_))
+					&& pane_state == TmuxPaneState::Hidden
+				{
+					pending_kitty_display = true;
+					if kitty_images_on_screen {
+						clear_kitty_placements_silent();
+						kitty_images_on_screen = false;
+					}
+					to_display = KittyDisplay::NoChange;
+				} else {
+					match &to_display {
+						KittyDisplay::DisplayImages(_) => {
+							kitty_images_on_screen = true;
+							pending_kitty_display = false;
+						}
+						KittyDisplay::ClearImages => {
+							kitty_images_on_screen = false;
+						}
+						KittyDisplay::NoChange => ()
+					}
+				}
+			}
 
 			let maybe_err =
 				display_kitty_images(to_display, &mut ev_stream, &mut kitty_z_idx).await;
@@ -675,6 +824,37 @@ fn osc_response_buf_to_color(response_buf: [u8; 25]) -> Option<i32> {
 	Some(i32::from_be_bytes([0, r, g, b]))
 }
 
+fn resolve_fallback_font_size() -> FontSize {
+	if is_tmux()
+		&& let Some((width, height)) = tmux_client_cell_size()
+	{
+		return FontSize { width, height };
+	}
+
+	if let Ok(mut ws) = window_size() {
+		// CSI 14 t returns the entire terminal window pixel size in tmux, not the pane's, so
+		// dividing it by split-pane columns/rows would inflate cell dimensions.
+		if (ws.width == 0 || ws.height == 0)
+			&& !is_tmux()
+			&& let Ok((w, h)) = get_font_size_through_stdio()
+		{
+			ws.width = w;
+			ws.height = h;
+		}
+		if ws.width > 0 && ws.height > 0 && ws.columns > 0 && ws.rows > 0 {
+			return FontSize {
+				width: (ws.width / ws.columns).max(1),
+				height: (ws.height / ws.rows).max(1)
+			};
+		}
+	}
+
+	FontSize {
+		width: 8,
+		height: 16
+	}
+}
+
 fn get_font_size_through_stdio() -> Result<(u16, u16), WrappedErr> {
 	// send the command code to get the terminal window size
 	print!("\x1b[14t");
@@ -755,5 +935,29 @@ mod tests {
 
 		eq(*b"\x1b]10;rgb:11/22/33\x1b\\000000", 0x11, 0x22, 0x33);
 		eq(*b"\x1b]11;rgb:aa11/23bf/fff0\x1b1", 0xaa, 0x23, 0xff);
+	}
+
+	#[test]
+	fn tmux_visibility_transitions_clear_on_hide_and_restore_when_visible() {
+		assert_eq!(
+			decide_tmux_visibility_action(TmuxPaneState::Hidden, true, false),
+			TmuxVisibilityAction::ClearAndDefer
+		);
+		assert_eq!(
+			decide_tmux_visibility_action(TmuxPaneState::Hidden, false, true),
+			TmuxVisibilityAction::None
+		);
+		assert_eq!(
+			decide_tmux_visibility_action(TmuxPaneState::VisibleUnfocused, false, true),
+			TmuxVisibilityAction::Restore
+		);
+		assert_eq!(
+			decide_tmux_visibility_action(TmuxPaneState::Focused, false, true),
+			TmuxVisibilityAction::Restore
+		);
+		assert_eq!(
+			decide_tmux_visibility_action(TmuxPaneState::VisibleUnfocused, true, false),
+			TmuxVisibilityAction::None
+		);
 	}
 }

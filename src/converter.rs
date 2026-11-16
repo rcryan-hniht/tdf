@@ -33,7 +33,9 @@ pub enum ConvertedImage {
 	Kitty {
 		img: MaybeTransferred,
 		cell_w: u16,
-		cell_h: u16
+		cell_h: u16,
+		px_w: u32,
+		px_h: u32
 	}
 }
 
@@ -46,9 +48,7 @@ impl ConvertedImage {
 				(width, height)
 			}
 			Self::Kitty {
-				img: _,
-				cell_w,
-				cell_h
+				cell_w, cell_h, ..
 			} => (*cell_w, *cell_h)
 		}
 	}
@@ -139,6 +139,7 @@ pub async fn run_conversion_loop(
 			height: page_info.img_data.cell_h
 		};
 
+		let (px_w, px_h) = dyn_img.dimensions();
 		let dyn_img = DynamicImage::ImageRgb8(dyn_img);
 
 		let txt_img = match picker.protocol_type() {
@@ -167,7 +168,9 @@ pub async fn run_conversion_loop(
 				ConvertedImage::Kitty {
 					img: MaybeTransferred::NotYet(img),
 					cell_w: page_info.img_data.cell_w,
-					cell_h: page_info.img_data.cell_h
+					cell_h: page_info.img_data.cell_h,
+					px_w,
+					px_h
 				}
 			}
 			_ => ConvertedImage::Generic(
@@ -197,26 +200,12 @@ pub async fn run_conversion_loop(
 		}))
 	}
 
-	fn handle_notif(msg: ConverterMsg, images: &mut Vec<Option<PageInfo>>, page: &mut usize) {
-		match msg {
-			ConverterMsg::AddImg(img) => {
-				let page_num = img.page_num;
-				images[page_num] = Some(img);
-			}
-			ConverterMsg::NumPages(n_pages) => {
-				fill_default(images, n_pages);
-				*page = (*page).min(n_pages - 1);
-			}
-			ConverterMsg::GoToPage(new_page) => *page = new_page
-		}
-	}
-
 	'outer: loop {
 		let mut iteration = 0;
 		loop {
 			match receiver.try_recv() {
 				Ok(msg) => {
-					handle_notif(msg, &mut images, &mut page);
+					handle_notif(msg, &mut images, &mut page, prerender);
 					continue 'outer;
 				}
 				Err(TryRecvError::Empty) => (),
@@ -243,8 +232,57 @@ pub async fn run_conversion_loop(
 			break;
 		};
 
-		handle_notif(msg, &mut images, &mut page);
+		handle_notif(msg, &mut images, &mut page, prerender);
 	}
 
 	Ok(())
+}
+
+fn handle_notif(
+	msg: ConverterMsg,
+	images: &mut Vec<Option<PageInfo>>,
+	page: &mut usize,
+	prerender: usize
+) {
+	match msg {
+		ConverterMsg::AddImg(img) => {
+			let page_num = img.page_num;
+			if let Some(slot) = images.get_mut(page_num) {
+				*slot = Some(img);
+			}
+		}
+		ConverterMsg::NumPages(n_pages) => {
+			fill_default(images, n_pages);
+			*page = (*page).min(n_pages.saturating_sub(1));
+		}
+		ConverterMsg::GoToPage(new_page) =>
+			if images.is_empty() {
+				*page = new_page;
+			} else {
+				*page = new_page.min(images.len() - 1);
+				let keep_start = page.saturating_sub(prerender);
+				let keep_end = page.saturating_add(prerender);
+				for (idx, slot) in images.iter_mut().enumerate() {
+					if idx < keep_start || idx > keep_end {
+						*slot = None;
+					}
+				}
+			},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn go_to_page_before_num_pages_preserves_target_page() {
+		let mut images = Vec::new();
+		let mut page = 0;
+		handle_notif(ConverterMsg::GoToPage(737), &mut images, &mut page, 20);
+		assert_eq!(page, 737);
+		handle_notif(ConverterMsg::NumPages(738), &mut images, &mut page, 20);
+		assert_eq!(page, 737);
+		assert_eq!(images.len(), 738);
+	}
 }

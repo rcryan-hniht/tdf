@@ -14,6 +14,7 @@ pub mod kitty;
 pub mod renderer;
 pub mod skip;
 pub mod tui;
+pub mod zathura;
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum FitOrFill {
@@ -33,6 +34,14 @@ pub fn scale_img_for_area(
 	(area_width, area_height): (f32, f32),
 	fit_or_fill: FitOrFill
 ) -> ScaledResult {
+	if img_width <= 0.0 || img_height <= 0.0 || area_width <= 0.0 || area_height <= 0.0 {
+		return ScaledResult {
+			width: 1.0,
+			height: 1.0,
+			scale_factor: 0.01
+		};
+	}
+
 	// and get its aspect ratio
 	let img_aspect_ratio = img_width / img_height;
 

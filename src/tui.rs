@@ -1,19 +1,16 @@
-use std::{borrow::Cow, io::stdout, num::NonZeroUsize};
+use std::{borrow::Cow, io::stdout, num::NonZeroUsize, path::PathBuf};
 
 use crossterm::{
 	event::{Event, KeyCode, KeyModifiers, MouseEventKind},
 	execute,
-	terminal::{
-		BeginSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-		enable_raw_mode
-	}
+	terminal::BeginSynchronizedUpdate
 };
 use kittage::display::DisplayLocation;
 use ratatui::{
 	Frame,
 	layout::{Constraint, Flex, Layout, Position, Rect},
 	prelude::{Line, Text},
-	style::{Color, Style},
+	style::{Color, Modifier, Style},
 	symbols::border,
 	text::Span,
 	widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap}
@@ -23,30 +20,60 @@ use ratatui_image::{FontSize, Image};
 use crate::{
 	FitOrFill,
 	converter::{ConvertedImage, MaybeTransferred},
-	kitty::{KittyDisplay, KittyReadyToDisplay},
+	kitty::{KittyDisplay, KittyReadyToDisplay, is_tmux},
 	renderer::{RenderError, fill_default},
-	skip::Skip
+	skip::Skip,
+	zathura::{
+		BisectState, FileState, JumpList, LinkActionKind, ListPickerState, MarkPos, PageLink,
+		PickerItem, PickerKind, TocNode, TocState, VisualTextState, complete_command,
+		copy_to_clipboard, load_file_state, open_external_uri, save_file_state
+	}
 };
+
+#[derive(Default)]
+enum Overlay {
+	#[default]
+	None,
+	Help,
+	Index,
+	Info,
+	VisualText(VisualTextState),
+	Picker(ListPickerState)
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum PendingPrefix {
+	#[default]
+	None,
+	G,
+	Z
+}
 
 pub struct Tui {
 	name: String,
+	file_path: PathBuf,
 	pub page: usize,
 	last_render: LastRender,
 	bottom_msg: BottomMessage,
-	// we use `prev_msg` to, for example, restore the 'search results' message on the bottom after
-	// jumping to a specific page
 	prev_msg: Option<BottomMessage>,
 	rendered: Vec<RenderedInfo>,
 	page_constraints: PageConstraints,
-	showing_help_msg: bool,
+	overlay: Overlay,
 	is_kitty: bool,
-	zoom: Option<Zoom>
+	zoom: Option<Zoom>,
+	state: FileState,
+	jumplist: JumpList,
+	bisect: BisectState,
+	toc: TocState,
+	doc_info: Vec<(String, String)>,
+	last_search_term: String,
+	search_backward: bool,
+	num_prefix: Option<usize>,
+	pending_prefix: PendingPrefix
 }
 
 #[derive(Default)]
 struct LastRender {
-	// Used as a way to track if we need to draw the images, to save ratatui from doing a lot of
-	// diffing work
 	rect: Rect,
 	pages_shown: usize,
 	unused_width: u16
@@ -57,45 +84,41 @@ pub enum BottomMessage {
 	#[default]
 	Help,
 	SearchResults(String),
+	Info(String),
 	Error(String),
 	Input(InputCommand),
 	Reloaded
 }
 
 pub enum InputCommand {
-	GoToPage(usize),
-	Search(String)
+	Search { term: String, backward: bool },
+	Command(String),
+	MarkSet,
+	MarkJump
 }
 
 struct PageConstraints {
 	max_wide: Option<NonZeroUsize>,
-	r_to_l: bool
+	r_to_l: bool,
+	first_page_solo: bool
 }
 
 #[derive(Default, Debug, Clone, Copy)]
 struct Zoom {
-	// just how much 'zoom' you have. 0 means it fills the screen (instead of fits), such
-	// that one axis is fully on-screen
 	level: i16,
-	// how many terminal-cells worth of content overflow the left side of the screen (and are thus
-	// not displayed)
 	cell_pan_from_left: u16,
-	// how many terminal-cells worth of content overflow the top side of the screen (and are thus
-	// not displayed)
 	cell_pan_from_top: u16,
 	max_pan_top: u16
 }
+
 impl Zoom {
-	/// Returns the zoom factor, where 1 is the default and means fill-screen
 	fn factor(self) -> f32 {
-		// TODO: Make these configurable once we have a good way to set options after startup
 		const ZOOM_RATE: f32 = 1.1;
 		const ZOOM_RATE_GRANULAR: f32 = 1.05;
 
 		if self.level > 0 {
 			ZOOM_RATE.powi(self.level.into())
 		} else {
-			// use a more granular zoom rate for the steps between fit-screen and fill-screen
 			ZOOM_RATE_GRANULAR.powi(self.level.into())
 		}
 	}
@@ -103,43 +126,54 @@ impl Zoom {
 	fn step_in(&mut self) {
 		self.level = self.level.saturating_add(1);
 	}
+
 	fn step_out(&mut self) {
 		self.level = self.level.saturating_sub(1);
 	}
 
-	// TODO: Make this configurable, maybe allow fractional steps?
-	// With fractional steps, it might also be a good idea to have these
-	// have the same ratio as the font aspect ratio.
+	fn reset_level(&mut self) {
+		self.level = 0;
+	}
+
 	const PAN_STEP_X: i16 = 6;
 	const PAN_STEP_Y: i16 = 6;
 
 	fn pan(&mut self, direction: Direction) {
+		let step = if direction.is_vertical() {
+			Self::PAN_STEP_Y
+		} else {
+			Self::PAN_STEP_X
+		};
+		self.pan_by(direction, step);
+	}
+
+	fn pan_by(&mut self, direction: Direction, step: i16) {
 		let (target, sign) = match direction {
 			Direction::Up => (&mut self.cell_pan_from_top, -1),
 			Direction::Down => (&mut self.cell_pan_from_top, 1),
 			Direction::Left => (&mut self.cell_pan_from_left, -1),
 			Direction::Right => (&mut self.cell_pan_from_left, 1)
 		};
-		let step = if direction.is_vertical() {
-			Self::PAN_STEP_Y
-		} else {
-			Self::PAN_STEP_X
-		};
 		*target = target.saturating_add_signed(sign * step);
 	}
-	fn pan_bottom(&mut self) {
+
+	fn pan_page_top(&mut self) {
 		self.cell_pan_from_top = 0;
 	}
-	fn pan_top(&mut self) {
+
+	fn pan_page_bottom(&mut self) {
 		self.cell_pan_from_top = u16::MAX;
 	}
+
 	fn pan_left(&mut self) {
 		self.cell_pan_from_left = 0;
 	}
+
 	fn pan_right(&mut self) {
 		self.cell_pan_from_left = u16::MAX;
 	}
 }
+
 #[derive(Clone, Copy, Debug)]
 enum Direction {
 	Up,
@@ -147,8 +181,8 @@ enum Direction {
 	Left,
 	Right
 }
+
 impl Direction {
-	/// Flips the directions for vertical and horizonal panning.
 	fn flip_mouse_xy(self) -> Self {
 		match self {
 			Self::Up => Self::Left,
@@ -157,6 +191,7 @@ impl Direction {
 			Self::Right => Self::Down
 		}
 	}
+
 	fn is_vertical(self) -> bool {
 		match self {
 			Self::Up | Self::Down => true,
@@ -165,17 +200,11 @@ impl Direction {
 	}
 }
 
-// This seems like a kinda weird struct because it holds two optionals but any representation
-// within it is valid; I think it's the best way to represent it
 #[derive(Default)]
 pub struct RenderedInfo {
-	// The image, if it has been rendered by `Converter` to that struct
 	img: Option<ConvertedImage>,
-	// The number of results for the current search term that have been found on this page. None if
-	// we haven't checked this page yet
-	// Also this isn't the most efficient representation of this value, but it's accurate, so like
-	// whatever I guess
-	num_results: Option<usize>
+	num_results: Option<usize>,
+	links: Vec<PageLink>
 }
 
 #[derive(PartialEq)]
@@ -184,21 +213,139 @@ pub struct RenderLayout {
 	pub top_and_bottom: Option<(Rect, Rect)>
 }
 
+pub struct StartupSync {
+	pub page: usize,
+	pub invert: bool,
+	pub rotate_steps: u8,
+	pub fit_or_fill: FitOrFill
+}
+
 impl Tui {
 	#[must_use]
-	pub fn new(name: String, max_wide: Option<NonZeroUsize>, r_to_l: bool, is_kitty: bool) -> Self {
+	pub fn new(
+		name: String,
+		file_path: PathBuf,
+		max_wide: Option<NonZeroUsize>,
+		r_to_l: bool,
+		is_kitty: bool
+	) -> Self {
+		let loaded = load_file_state(&file_path).unwrap_or_default();
+		let effective_max_wide = max_wide.or_else(|| {
+			if loaded.dual_page {
+				NonZeroUsize::new(2)
+			} else {
+				NonZeroUsize::new(1)
+			}
+		});
+		let zoom = if is_kitty {
+			loaded.zoom_level.map(|level| Zoom {
+				level,
+				cell_pan_from_left: loaded.pan_left,
+				cell_pan_from_top: loaded.pan_top,
+				max_pan_top: u16::MAX
+			})
+		} else {
+			None
+		};
+
 		Self {
 			name,
-			page: 0,
+			file_path,
+			page: loaded.page,
 			prev_msg: None,
 			bottom_msg: BottomMessage::Help,
 			last_render: LastRender::default(),
 			rendered: vec![],
-			page_constraints: PageConstraints { max_wide, r_to_l },
-			showing_help_msg: false,
+			page_constraints: PageConstraints {
+				max_wide: effective_max_wide,
+				r_to_l,
+				first_page_solo: loaded.first_page_solo
+			},
+			overlay: Overlay::None,
 			is_kitty,
-			zoom: None
+			zoom,
+			state: loaded,
+			jumplist: JumpList::default(),
+			bisect: BisectState::default(),
+			toc: TocState::default(),
+			doc_info: Vec::new(),
+			last_search_term: String::new(),
+			search_backward: false,
+			num_prefix: None,
+			pending_prefix: PendingPrefix::None
 		}
+	}
+
+	#[must_use]
+	pub fn startup_sync(&self) -> StartupSync {
+		StartupSync {
+			page: self.page,
+			invert: self.state.invert,
+			rotate_steps: self.state.rotate_steps,
+			fit_or_fill: if self.zoom.is_some() {
+				FitOrFill::Fill
+			} else {
+				FitOrFill::Fit
+			}
+		}
+	}
+
+	pub fn invalidate_render(&mut self) {
+		self.last_render.rect = Rect::default();
+	}
+
+	pub fn save_state(&mut self) {
+		self.state.page = self.page;
+		self.state.dual_page = self
+			.page_constraints
+			.max_wide
+			.is_some_and(|w| w.get() >= 2);
+		self.state.first_page_solo = self.page_constraints.first_page_solo;
+		if let Some(z) = self.zoom {
+			self.state.zoom_level = Some(z.level);
+			self.state.pan_left = z.cell_pan_from_left;
+			self.state.pan_top = z.cell_pan_from_top;
+		} else {
+			self.state.zoom_level = None;
+			self.state.pan_left = 0;
+			self.state.pan_top = 0;
+		}
+		save_file_state(&self.file_path, &self.state);
+	}
+
+	fn current_mark_pos(&self) -> MarkPos {
+		let (pan_left, pan_top) = self
+			.zoom
+			.map_or((0, 0), |z| (z.cell_pan_from_left, z.cell_pan_from_top));
+		MarkPos {
+			page: self.page,
+			pan_left,
+			pan_top
+		}
+	}
+
+	fn jump_with_history(&mut self, target: MarkPos) -> Option<InputAction> {
+		let cur = self.current_mark_pos();
+		self.jumplist.record(cur);
+		self.bisect.reset();
+		self.apply_mark_pos(target)
+	}
+
+	fn apply_mark_pos(&mut self, target: MarkPos) -> Option<InputAction> {
+		let clamped = if self.rendered.is_empty() {
+			target.page
+		} else {
+			target.page.min(self.rendered.len() - 1)
+		};
+		self.page = clamped;
+		self.last_render.rect = Rect::default();
+		if let Some(ref mut z) = self.zoom {
+			z.cell_pan_from_left = target.pan_left;
+			z.cell_pan_from_top = target.pan_top;
+			z.max_pan_top = u16::MAX;
+		}
+		self.save_state();
+		Some(InputAction::JumpingToPage(clamped))
 	}
 
 	#[must_use]
@@ -227,52 +374,53 @@ impl Tui {
 	}
 
 	fn render_zoomed<'s>(
-		// area of the 'fit-screen' page
 		mut img_area: Rect,
 		font_size: FontSize,
 		zoom: &mut Zoom,
 		img: &'s mut MaybeTransferred,
 		page_num: usize,
-		img_cell_w: u16,
-		img_cell_h: u16
+		(img_cell_w, img_cell_h): (u16, u16),
+		(img_px_w, img_px_h): (u32, u32)
 	) -> KittyDisplay<'s> {
-		log::debug!("zoom is {zoom:#?}");
-		log::debug!("page area is {img_area:#?}");
-		log::debug!("img dimensions are {img_cell_w}x{img_cell_h}");
+		if img_area.width == 0
+			|| img_area.height == 0
+			|| img_cell_w == 0
+			|| img_cell_h == 0
+			|| font_size.width == 0
+			|| font_size.height == 0
+		{
+			return KittyDisplay::ClearImages;
+		}
 
-		// Dimensions of the section of the image to be displayed.
-		// Kittage calls this the "image area to display".
-		// We need to shrink this or the page area in order to zoom in or out,
-		// respectively.
-		let mut img_section_w = f32::from(img_cell_w);
-		let mut img_section_h = f32::from(img_cell_h);
+		let mut img_section_w = if img_px_w > 0 {
+			img_px_w as f32 / f32::from(font_size.width)
+		} else {
+			f32::from(img_cell_w)
+		};
+		let mut img_section_h = if img_px_h > 0 {
+			img_px_h as f32 / f32::from(font_size.height)
+		} else {
+			f32::from(img_cell_h)
+		};
 
 		let zoom_factor = zoom.factor();
 
 		if zoom_factor >= 1.0 {
-			// Use a smaller section of the image. This efficively zooms into that section.
 			img_section_w /= zoom_factor;
 			img_section_h /= zoom_factor;
 		} else {
-			// Shrink the page area, such that the fill-screen conversion
-			// will zoom out of the image.
 			let initial_page_w = f32::from(img_area.width);
 			let initial_page_h = f32::from(img_area.height);
 
-			// how many pages the image is wide/high
 			let img_page_w_ratio = img_section_w / initial_page_w;
 			let img_page_h_ratio = img_section_h / initial_page_h;
 
 			fn shrink_move_page(dim: &mut u16, pos: &mut u16, axis_zoom_factor: f32) {
 				let old_dim = *dim;
-				// The axis zoom factor tells us what portion of the axis
-				// we need to show.
-				*dim = (f32::from(*dim) * axis_zoom_factor) as u16;
+				let clamped_factor = axis_zoom_factor.clamp(0.05, 1.0);
+				*dim = ((f32::from(*dim) * clamped_factor) as u16).max(1).min(old_dim);
 
-				*pos += old_dim
-					.checked_sub(*dim)
-					.expect("zooming out should shrink the image")
-					/ 2;
+				*pos += old_dim.saturating_sub(*dim) / 2;
 			}
 
 			fn shrink_move_two_pass(
@@ -282,11 +430,6 @@ impl Tui {
 				zoom_factor: f32,
 				axis_zoom_factor: f32
 			) {
-				// To detect if we're already at fit-screen, we perform a first
-				// pass on `img_area` that emulates the last call to
-				// `render_zoomed` by subtracting from the `zoom`'s level. This
-				// holds because the `img_area` that gets passed is always the
-				// same.
 				let mut first_pass_dim = *dim;
 				let mut first_pass_pos = *pos;
 				let mut first_pass_zoom = *zoom;
@@ -294,22 +437,16 @@ impl Tui {
 				if first_pass_zoom.level.is_negative() {
 					first_pass_zoom.step_in();
 				}
+				let min_axis_factor = (1.0 / axis_zoom_factor.max(0.05)).min(1.0);
 				let first_pass_zoom_factor = first_pass_zoom.factor();
 				shrink_move_page(
 					&mut first_pass_dim,
 					&mut first_pass_pos,
-					first_pass_zoom_factor.max(1.0 / axis_zoom_factor)
+					first_pass_zoom_factor.max(min_axis_factor)
 				);
 
-				log::debug!("first_pass_dim: {first_pass_dim}, first_pass_pos: {first_pass_pos}");
-				// vertical scroll / tall image. zooming out means decreasing
-				// the width of the page area
-				// use `max` to disallow zooming out past fit-screen
-				shrink_move_page(dim, pos, zoom_factor.max(1.0 / axis_zoom_factor));
+				shrink_move_page(dim, pos, zoom_factor.max(min_axis_factor));
 
-				log::debug!("new dim: {dim}, new pos: {pos}");
-				// The moment the image area is left unmodified, we've hit
-				// fit-screen and the zoom level ought be normalized.
 				if first_pass_dim == *dim && first_pass_pos == *pos {
 					zoom.step_in();
 				}
@@ -318,28 +455,15 @@ impl Tui {
 			let (dim, pos, axis_zoom_factor) = if img_page_w_ratio < img_page_h_ratio {
 				(&mut img_area.width, &mut img_area.x, img_page_h_ratio)
 			} else {
-				// horizontal scroll / wide image. zooming out means decreasing
-				// the height of the page area
 				(&mut img_area.height, &mut img_area.y, img_page_w_ratio)
 			};
 			shrink_move_two_pass(zoom, dim, pos, zoom_factor, axis_zoom_factor);
 		}
-		log::debug!("after adjustment, page area is {img_area:#?}");
 
-		// Crop the image such that in the end, the aspect ratio of the section
-		// is the same as that of the page area. This effectively performs the
-		// conversion to fill-screen.
-		// Note that this only works because cell_w, cell_h is in fit-screen
-		// format, i.e. the cell size and the page area already share at
-		// least one dimension.
 		{
-			let page_area_w = f32::from(img_area.width);
-			let page_area_h = f32::from(img_area.height);
+			let page_area_w = f32::from(img_area.width.max(1));
+			let page_area_h = f32::from(img_area.height.max(1));
 
-			// how many pages the image is wide/high
-			// Note that this is not the same as during the
-			// zoom-out calculation, since it changed the page
-			// dimensions.
 			let img_page_w_ratio = img_section_w / page_area_w;
 			let img_page_h_ratio = img_section_h / page_area_h;
 
@@ -350,15 +474,23 @@ impl Tui {
 			}
 		}
 
-		let width = (img_section_w * f32::from(font_size.width)) as u32;
-		let height = (img_section_h * f32::from(font_size.height)) as u32;
-
 		let max_pan_top = img_cell_h.saturating_sub(img_section_h.ceil() as u16);
 		zoom.cell_pan_from_left = zoom
 			.cell_pan_from_left
 			.min(img_cell_w.saturating_sub(img_section_w.ceil() as u16));
 		zoom.cell_pan_from_top = zoom.cell_pan_from_top.min(max_pan_top);
 		zoom.max_pan_top = max_pan_top;
+
+		let pan_x = u32::from(zoom.cell_pan_from_left) * u32::from(font_size.width);
+		let pan_y = u32::from(zoom.cell_pan_from_top) * u32::from(font_size.height);
+		let mut width = (img_section_w * f32::from(font_size.width)).round() as u32;
+		let mut height = (img_section_h * f32::from(font_size.height)).round() as u32;
+		if img_px_w > 0 {
+			width = width.min(img_px_w.saturating_sub(pan_x)).max(1);
+		}
+		if img_px_h > 0 {
+			height = height.min(img_px_h.saturating_sub(pan_y)).max(1);
+		}
 
 		KittyDisplay::DisplayImages(vec![KittyReadyToDisplay {
 			img,
@@ -368,8 +500,8 @@ impl Tui {
 				y: img_area.y
 			},
 			display_loc: DisplayLocation {
-				x: u32::from(zoom.cell_pan_from_left) * u32::from(font_size.width),
-				y: u32::from(zoom.cell_pan_from_top) * u32::from(font_size.height),
+				x: pan_x,
+				y: pan_y,
 				width,
 				height,
 				columns: img_area.width,
@@ -386,95 +518,127 @@ impl Tui {
 		full_layout: &RenderLayout,
 		font_size: FontSize
 	) -> KittyDisplay<'s> {
-		if self.showing_help_msg {
-			self.render_help_msg(frame);
-			return KittyDisplay::ClearImages;
+		match &self.overlay {
+			Overlay::Help => {
+				self.render_help_msg(frame);
+				return KittyDisplay::ClearImages;
+			}
+			Overlay::Index => {
+				self.render_toc_overlay(frame);
+				return KittyDisplay::ClearImages;
+			}
+			Overlay::Info => {
+				self.render_info_overlay(frame);
+				return KittyDisplay::ClearImages;
+			}
+			Overlay::VisualText(vs) => {
+				Self::render_visual_overlay(frame, vs);
+				return KittyDisplay::ClearImages;
+			}
+			Overlay::Picker(picker) => {
+				Self::render_picker_overlay(frame, picker);
+				return KittyDisplay::ClearImages;
+			}
+			Overlay::None => ()
 		}
 
 		if let Some(t_and_b) = full_layout.top_and_bottom {
 			Self::render_top_and_bottom(
 				t_and_b,
 				self.page,
+				self.state.page_offset,
+				&self.page_constraints,
 				&self.rendered,
 				&self.name,
 				frame,
-				&self.bottom_msg
+				&self.bottom_msg,
+				self.num_prefix,
+				self.pending_prefix
 			);
 		}
 
 		let mut img_area = full_layout.page_area;
+		if img_area.width == 0 || img_area.height == 0 {
+			return KittyDisplay::ClearImages;
+		}
 
 		let size = frame.area();
 		if size == self.last_render.rect {
-			// If we haven't resized (and haven't used the Rect as a way to mark that we need to
-			// resize this time), then go through every element in the buffer where any Image would
-			// be written and set to skip it so that ratatui doesn't spend a lot of time diffing it
-			// each re-render
 			frame.render_widget(Skip, img_area);
 			return KittyDisplay::NoChange;
 		}
 
-		if let Some(ref mut zoom) = self.zoom {
-			// yes this is ugly and I hate it. it's due to the limitations that currently exist
-			// in the borrow checker. Once `-Zpolonius=next` is stabilized, we can rework this
-			// to look like what we expect.
-			// See https://github.com/rust-lang/rfcs/blob/master/text/2094-nll.md#problem-case-3-conditional-control-flow-across-functions
-			// You can also rewrite this to just if an `if let` and run it under
-			// `RUSTFLAGS="-Zpolonius=next"` and see that it works
-			if self.rendered[self.page]
-				.img
-				.as_ref()
+		if let Some(ref mut zoom) = self.zoom
+			&& self
+				.rendered
+				.get(self.page)
+				.and_then(|slot| slot.img.as_ref())
 				.is_some_and(|c| matches!(c, ConvertedImage::Kitty { .. }))
-			{
-				let Some(ConvertedImage::Kitty {
-					ref mut img,
-					cell_w,
-					cell_h
-				}) = self.rendered[self.page].img
-				else {
-					unreachable!()
-				};
+		{
+			let Some(ConvertedImage::Kitty {
+				ref mut img,
+				cell_w,
+				cell_h,
+				px_w,
+				px_h
+			}) = self.rendered[self.page].img
+			else {
+				unreachable!()
+			};
 
-				self.last_render = LastRender {
-					rect: size,
-					pages_shown: 1,
-					unused_width: 0
-				};
-				return Self::render_zoomed(
-					img_area, font_size, zoom, img, self.page, cell_w, cell_h
-				);
-			}
+			self.last_render = LastRender {
+				rect: size,
+				pages_shown: 1,
+				unused_width: 0
+			};
+			return Self::render_zoomed(
+				img_area,
+				font_size,
+				zoom,
+				img,
+				self.page,
+				(cell_w, cell_h),
+				(px_w, px_h)
+			);
 		}
 
-		// here we calculate how many pages can fit in the available area.
+		if self.rendered.is_empty() || self.page >= self.rendered.len() {
+			Self::render_loading_in(frame, img_area);
+			return KittyDisplay::ClearImages;
+		}
+
+		let max_pages_this_view = if self.page_constraints.first_page_solo && self.page == 0 {
+			Some(NonZeroUsize::MIN)
+		} else {
+			self.page_constraints.max_wide
+		};
+
 		let mut test_area_w = img_area.width;
-		// go through our pages, starting at the first one we want to view
 		let mut page_sizes = self.rendered[self.page..]
 			.iter_mut()
-			// and get this to represent a count of how many we're looking at so far to render
 			.enumerate()
-			// and only take as many as are ready to be rendered
 			.take_while(|(idx, page)| {
 				let mut take = page.img.is_some();
-				if let Some(max) = self.page_constraints.max_wide {
+				if let Some(max) = max_pages_this_view {
 					take &= *idx < max.get();
 				}
 				take
 			})
-			// and map it to their width (in cells on the terminal, not pixels)
 			.filter_map(|(_, page)| {
 				page.img.as_mut().map(|img| {
 					let (w, h) = img.w_h();
 					(w, h, img)
 				})
 			})
-			// and then take them as long as they won't overflow the available area.
-			.take_while(|(width, _, _)| match test_area_w.checked_sub(*width) {
-				Some(new_val) => {
-					test_area_w = new_val;
-					true
-				}
-				None => false
+			.take_while(|(width, height, _)| {
+				*height <= img_area.height
+					&& match test_area_w.checked_sub(*width) {
+						Some(new_val) => {
+							test_area_w = new_val;
+							true
+						}
+						None => false
+					}
 			})
 			.collect::<Vec<_>>();
 
@@ -483,11 +647,10 @@ impl Tui {
 		}
 
 		if page_sizes.is_empty() {
-			// If none are ready to render, just show the loading thing
 			Self::render_loading_in(frame, img_area);
 			KittyDisplay::ClearImages
 		} else {
-			execute!(stdout(), BeginSynchronizedUpdate).unwrap();
+			let _ = execute!(stdout(), BeginSynchronizedUpdate);
 
 			let total_width = page_sizes.iter().map(|(w, _, _)| w).sum::<u16>();
 
@@ -497,11 +660,10 @@ impl Tui {
 			self.last_render.unused_width = unused_width;
 			img_area.x += unused_width / 2;
 
-			if let Some(total_height) = page_sizes.iter().map(|(_, h, _)| h).max() {
-				// This subtraction might sporadicly fail while shrinking the window.
-				if let Some(unused_height) = img_area.height.checked_sub(*total_height) {
-					img_area.y += unused_height / 2;
-				}
+			if let Some(total_height) = page_sizes.iter().map(|(_, h, _)| h).max()
+				&& let Some(unused_height) = img_area.height.checked_sub(*total_height)
+			{
+				img_area.y += unused_height / 2;
 			}
 
 			let to_display = page_sizes
@@ -520,8 +682,6 @@ impl Tui {
 				})
 				.collect::<Vec<_>>();
 
-			// we want to set this at the very end so it doesn't get set somewhere halfway through and
-			// then the whole diffing thing messes it up
 			self.last_render.rect = size;
 
 			KittyDisplay::DisplayImages(to_display)
@@ -538,11 +698,7 @@ impl Tui {
 				frame.render_widget(Image::new(page_img), img_area);
 				None
 			}
-			ConvertedImage::Kitty {
-				img,
-				cell_h: _,
-				cell_w: _
-			} => Some((img, Position {
+			ConvertedImage::Kitty { img, .. } => Some((img, Position {
 				x: img_area.x,
 				y: img_area.y
 			}))
@@ -561,16 +717,21 @@ impl Tui {
 		frame.render_widget(loading_span, inner_space[0]);
 	}
 
-	fn change_page(&mut self, mut change: PageChange, amt: ChangeAmount) -> Option<InputAction> {
-		let diff = match amt {
+	fn change_page(
+		&mut self,
+		mut change: PageChange,
+		amt: ChangeAmount,
+		count: usize
+	) -> Option<InputAction> {
+		if self.rendered.is_empty() {
+			return None;
+		}
+		let base_step = match amt {
 			ChangeAmount::Single => 1,
-			ChangeAmount::WholeScreen => self.last_render.pages_shown
+			ChangeAmount::WholeScreen => self.last_render.pages_shown.max(1)
 		};
+		let diff = base_step.saturating_mul(count.max(1));
 
-		// This is a kinda weird way to switch around the controls for this sort of thing but it
-		// allows it to be pretty centralized and avoids annoyingly duplicated match arms (since
-		// we'd have to do `match key { 'h' if r_to_l | 'l' => {}}` and that doesn't play well with
-		// `if` guards on match arms)
 		if self.page_constraints.r_to_l {
 			change = match change {
 				PageChange::Next => PageChange::Prev,
@@ -598,11 +759,14 @@ impl Tui {
 			}
 		}
 
-		// Yes these conversions could wrap around if you have > isize::MAX pages, but we already
-		// decided that you deserve to suffer if you have more than u32::MAX pages, so that's fine.
+		self.bisect.reset();
+
 		match self.page as isize - old as isize {
 			0 => None,
-			_ => Some(InputAction::JumpingToPage(self.page))
+			_ => {
+				self.save_state();
+				Some(InputAction::JumpingToPage(self.page))
+			}
 		}
 	}
 
@@ -611,16 +775,45 @@ impl Tui {
 		self.page = self.page.min(n_pages - 1);
 	}
 
+	pub fn set_doc_metadata(&mut self, outlines: Vec<TocNode>, info: Vec<(String, String)>) {
+		self.toc = TocState::new(outlines);
+		self.doc_info = info;
+	}
+
+	pub fn set_page_links(&mut self, page_num: usize, links: Vec<PageLink>) {
+		if let Some(slot) = self.rendered.get_mut(page_num) {
+			slot.links = links;
+		}
+	}
+
+	pub fn got_page_text(&mut self, page_num: usize, text: String, open_visual: bool) {
+		if open_visual {
+			self.overlay = Overlay::VisualText(VisualTextState::new(page_num, &text));
+			self.last_render.rect = Rect::default();
+		} else {
+			let trimmed = text.trim();
+			if trimmed.is_empty() {
+				self.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+					"Page {} has no extractable text",
+					page_num + 1
+				))));
+			} else {
+				let _ = copy_to_clipboard(trimmed, is_tmux());
+				self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+					"Copied page {} text ({} chars) to clipboard",
+					page_num + 1,
+					trimmed.chars().count()
+				))));
+			}
+		}
+	}
+
 	pub fn page_ready(&mut self, img: ConvertedImage, page_num: usize, num_results: usize) {
-		// If this new image woulda fit within the available space on the last render AND it's
-		// within the range where it might've been rendered with the last shown pages, then reset
-		// the last rect marker so that all images are forced to redraw on next render and this one
-		// is drawn with them
 		if page_num >= self.page && page_num <= self.page + self.last_render.pages_shown {
 			self.last_render.rect = Rect::default();
 		} else {
 			let img_w = img.w_h().0;
-			if img_w <= self.last_render.unused_width {
+			if img_w > 0 && img_w <= self.last_render.unused_width {
 				let num_fit = self.last_render.unused_width / img_w;
 				if page_num >= self.page && (self.page + num_fit as usize) >= page_num {
 					self.last_render.rect = Rect::default();
@@ -628,36 +821,94 @@ impl Tui {
 			}
 		}
 
-		// We always just set this here because we handle reloading in the `set_n_pages` function.
-		// If the document was reloaded, then It'll have the `set_n_pages` called to set the new
-		// number of pages, so the vec will already be cleared
-		self.rendered[page_num] = RenderedInfo {
-			img: Some(img),
-			num_results: Some(num_results)
-		};
+		if let Some(slot) = self.rendered.get_mut(page_num) {
+			let prev_links = std::mem::take(&mut slot.links);
+			*slot = RenderedInfo {
+				img: Some(img),
+				num_results: Some(num_results),
+				links: prev_links
+			};
+		}
+	}
+
+	pub fn evict_far_page(&mut self) -> Option<usize> {
+		const MAX_CACHED_PAGES: usize = 32;
+		let cached_count = self.rendered.iter().filter(|r| r.img.is_some()).count();
+		if cached_count <= MAX_CACHED_PAGES {
+			return None;
+		}
+		let farthest = self
+			.rendered
+			.iter()
+			.enumerate()
+			.filter(|(_, r)| r.img.is_some())
+			.max_by_key(|(idx, _)| idx.abs_diff(self.page))
+			.map(|(idx, _)| idx)?;
+		if let Some(slot) = self.rendered.get_mut(farthest) {
+			slot.img = None;
+		}
+		Some(farthest)
 	}
 
 	pub fn page_failed_display(&mut self, page_num: usize) {
-		self.rendered[page_num].img = None;
+		if let Some(slot) = self.rendered.get_mut(page_num) {
+			slot.img = None;
+		}
 	}
 
 	pub fn got_num_results_on_page(&mut self, page_num: usize, num_results: usize) {
-		self.rendered[page_num].num_results = Some(num_results);
+		if let Some(slot) = self.rendered.get_mut(page_num) {
+			slot.num_results = Some(num_results);
+		}
 	}
 
-	pub fn render_top_and_bottom(
+	#[expect(clippy::too_many_arguments)]
+	fn render_top_and_bottom(
 		(top_area, bottom_area): (Rect, Rect),
 		page_num: usize,
+		page_offset: i32,
+		constraints: &PageConstraints,
 		rendered: &[RenderedInfo],
 		doc_name: &str,
 		frame: &mut Frame<'_>,
-		bottom_msg: &BottomMessage
+		bottom_msg: &BottomMessage,
+		num_prefix: Option<usize>,
+		pending_prefix: PendingPrefix
 	) {
-		// use the extra space here to add some padding to the right side
-		let page_nums_text = format!("{} / {} ", page_num + 1, rendered.len());
+		let total = rendered.len();
+		let pct = if total > 0 {
+			((page_num + 1) * 100) / total
+		} else {
+			0
+		};
+		let mode_tag = if constraints.max_wide.is_some_and(|w| w.get() >= 2) {
+			if constraints.first_page_solo {
+				"[2p:1] "
+			} else {
+				"[2p] "
+			}
+		} else {
+			""
+		};
+		let prefix_str = match (num_prefix, pending_prefix) {
+			(Some(n), PendingPrefix::G) => format!("{n}g "),
+			(Some(n), PendingPrefix::Z) => format!("{n}z "),
+			(Some(n), PendingPrefix::None) => format!("{n} "),
+			(None, PendingPrefix::G) => "g ".to_string(),
+			(None, PendingPrefix::Z) => "z ".to_string(),
+			(None, PendingPrefix::None) => String::new()
+		};
+		let page_nums_text = if page_offset != 0 {
+			let logical = (page_num as i32 + 1) - page_offset;
+			format!(
+				"{prefix_str}{mode_tag}{logical} ({}/{total}) [{pct}%] ",
+				page_num + 1
+			)
+		} else {
+			format!("{prefix_str}{mode_tag}{} / {total} [{pct}%] ", page_num + 1)
+		};
 
 		let top_block = Block::new()
-			// use this first title to add a bit of padding to the left side
 			.title_top(" ")
 			.title_top(Span::styled(doc_name, Style::new().fg(Color::Cyan)))
 			.title_top(
@@ -702,24 +953,45 @@ impl Tui {
 		frame.render_widget(rendered_span, bottom_layout[1]);
 
 		let (msg_str, color): (Cow<'_, str>, _) = match bottom_msg {
-			BottomMessage::Help => ("?: Show help page".into(), Color::Blue),
+			BottomMessage::Help => (
+				":help / F1: Help | Tab: Index | /: Search | :: Command".into(),
+				Color::Blue
+			),
+			BottomMessage::Info(msg) => (msg.as_str().into(), Color::Cyan),
 			BottomMessage::Error(e) => (e.as_str().into(), Color::Red),
 			BottomMessage::Input(input_state) => (
 				match input_state {
-					InputCommand::GoToPage(page) => format!("Go to: {page}"),
-					InputCommand::Search(s) => format!("Search: {s}")
+					InputCommand::Search {
+						term,
+						backward: false
+					} => format!("/{term}"),
+					InputCommand::Search {
+						term,
+						backward: true
+					} => format!("?{term}"),
+					InputCommand::Command(s) => format!(":{s}"),
+					InputCommand::MarkSet => "m".to_string(),
+					InputCommand::MarkJump => "'".to_string()
 				}
 				.into(),
 				Color::Blue
 			),
 			BottomMessage::SearchResults(term) => {
 				let num_found = rendered.iter().filter_map(|r| r.num_results).sum::<usize>();
+				let pages_hit = rendered
+					.iter()
+					.filter(|r| r.num_results.is_some_and(|n| n > 0))
+					.count();
 				let num_searched =
 					rendered.iter().filter(|r| r.num_results.is_some()).count() * 100;
+				let pct_searched = if rendered.is_empty() {
+					0
+				} else {
+					num_searched / rendered.len()
+				};
 				(
 					format!(
-						"Results for '{term}': {num_found} (searched: {}%)",
-						num_searched / rendered.len()
+						"/{term}: {num_found} hits on {pages_hit}p (searched: {pct_searched}%)"
 					)
 					.into(),
 					Color::Blue
@@ -732,138 +1004,1201 @@ impl Tui {
 		frame.render_widget(span, bottom_layout[0]);
 	}
 
-	pub fn handle_event(&mut self, ev: &Event) -> Option<InputAction> {
-		fn jump_to_page(page: &mut usize, rect: &mut Rect, new_page: usize) -> InputAction {
-			*page = new_page;
-			// Make sure we re-render
-			*rect = Rect::default();
-			InputAction::JumpingToPage(new_page)
+	fn handle_overlay_key(
+		&mut self,
+		code: KeyCode,
+		modifiers: KeyModifiers
+	) -> Option<InputAction> {
+		let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+		let is_abort = matches!(code, KeyCode::Esc)
+			|| (ctrl && matches!(code, KeyCode::Char('c' | '[')));
+
+		match &mut self.overlay {
+			Overlay::None => None,
+			Overlay::Help | Overlay::Info => {
+				if is_abort || matches!(code, KeyCode::Char('q') | KeyCode::F(1)) {
+					self.overlay = Overlay::None;
+					self.last_render.rect = Rect::default();
+					Some(InputAction::Redraw)
+				} else {
+					None
+				}
+			}
+			Overlay::Index => {
+				let total = self.toc.flat.len();
+				if is_abort || matches!(code, KeyCode::Tab) {
+					self.toc.pending_g = false;
+					self.toc.pending_z = false;
+					self.overlay = Overlay::None;
+					self.last_render.rect = Rect::default();
+					return Some(InputAction::Redraw);
+				}
+				match code {
+					KeyCode::Char('q') => Some(InputAction::QuitApp),
+					KeyCode::Char('d') if ctrl => {
+						if total > 0 {
+							self.toc.cursor = (self.toc.cursor + 10).min(total - 1);
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('u') if ctrl => {
+						self.toc.cursor = self.toc.cursor.saturating_sub(10);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('f') if ctrl => {
+						if total > 0 {
+							self.toc.cursor = (self.toc.cursor + 20).min(total - 1);
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('b') if ctrl => {
+						self.toc.cursor = self.toc.cursor.saturating_sub(20);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('j') if ctrl => self.activate_selected_toc_entry(),
+					KeyCode::Char(c) if self.toc.pending_z => {
+						self.toc.pending_z = false;
+						match c {
+							'c' => self.toc.set_current_expanded(false, false),
+							'C' => self.toc.set_current_expanded(false, true),
+							'M' => self.toc.set_all_expanded(false),
+							'o' => self.toc.set_current_expanded(true, false),
+							'O' => self.toc.set_current_expanded(true, true),
+							'R' => self.toc.set_all_expanded(true),
+							_ => ()
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('g') if self.toc.pending_g => {
+						self.toc.pending_g = false;
+						self.toc.cursor = 0;
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('g') => {
+						self.toc.pending_g = true;
+						None
+					}
+					KeyCode::Char('z') => {
+						self.toc.pending_z = true;
+						None
+					}
+					KeyCode::Char('j') | KeyCode::Down => {
+						self.toc.pending_g = false;
+						if total > 0 {
+							self.toc.cursor = (self.toc.cursor + 1).min(total - 1);
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('k') | KeyCode::Up => {
+						self.toc.pending_g = false;
+						self.toc.cursor = self.toc.cursor.saturating_sub(1);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::PageDown => {
+						if total > 0 {
+							self.toc.cursor = (self.toc.cursor + 15).min(total - 1);
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::PageUp => {
+						self.toc.cursor = self.toc.cursor.saturating_sub(15);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('G') | KeyCode::End => {
+						self.toc.pending_g = false;
+						if total > 0 {
+							self.toc.cursor = total - 1;
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Home => {
+						self.toc.cursor = 0;
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('h') | KeyCode::Left => {
+						self.toc.set_current_expanded(false, false);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('H') => {
+						self.toc.set_all_expanded(false);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('l') | KeyCode::Right => {
+						self.toc.set_current_expanded(true, false);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('L') => {
+						self.toc.set_all_expanded(true);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Enter | KeyCode::Char(' ') => self.activate_selected_toc_entry(),
+					_ => {
+						self.toc.pending_g = false;
+						self.toc.pending_z = false;
+						None
+					}
+				}
+			}
+			Overlay::VisualText(vs) => {
+				let total = vs.lines.len();
+				if is_abort {
+					self.overlay = Overlay::None;
+					self.last_render.rect = Rect::default();
+					return Some(InputAction::Redraw);
+				}
+				match code {
+					KeyCode::Char('q') => Some(InputAction::QuitApp),
+					KeyCode::Char('d') if ctrl => {
+						vs.cursor = (vs.cursor + 10).min(total.saturating_sub(1));
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('u') if ctrl => {
+						vs.cursor = vs.cursor.saturating_sub(10);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('g') if vs.pending_g => {
+						vs.pending_g = false;
+						vs.cursor = 0;
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('g') => {
+						vs.pending_g = true;
+						None
+					}
+					KeyCode::Char('G') | KeyCode::End => {
+						vs.pending_g = false;
+						vs.cursor = total.saturating_sub(1);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Home | KeyCode::Char('0' | '^') => {
+						vs.cursor = 0;
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('$') => {
+						vs.cursor = total.saturating_sub(1);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('j') | KeyCode::Down => {
+						vs.pending_g = false;
+						vs.cursor = (vs.cursor + 1).min(total.saturating_sub(1));
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('k') | KeyCode::Up => {
+						vs.pending_g = false;
+						vs.cursor = vs.cursor.saturating_sub(1);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('v' | 'V') => {
+						vs.pending_g = false;
+						if vs.anchor.is_some() {
+							vs.anchor = None;
+						} else {
+							vs.anchor = Some(vs.cursor);
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('o') => {
+						if let Some(ref mut a) = vs.anchor {
+							std::mem::swap(a, &mut vs.cursor);
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char(':' ) => {
+						self.overlay = Overlay::None;
+						self.last_render.rect = Rect::default();
+						self.set_msg(MessageSetting::Some(BottomMessage::Input(
+							InputCommand::Command(String::new())
+						)));
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('y' | 'Y') => {
+						let selected = vs.selected_text();
+						let (start, end) = vs.selected_range();
+						let line_count = end - start + 1;
+						let _ = copy_to_clipboard(&selected, is_tmux());
+						self.overlay = Overlay::None;
+						self.last_render.rect = Rect::default();
+						self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+							"Yanked {line_count} line(s) to clipboard"
+						))));
+						Some(InputAction::Redraw)
+					}
+					_ => {
+						vs.pending_g = false;
+						None
+					}
+				}
+			}
+			Overlay::Picker(picker) => {
+				let total = picker.items.len();
+				if is_abort {
+					self.overlay = Overlay::None;
+					self.last_render.rect = Rect::default();
+					return Some(InputAction::Redraw);
+				}
+				match code {
+					KeyCode::Char('q') => Some(InputAction::QuitApp),
+					KeyCode::Char('j') | KeyCode::Down => {
+						if total > 0 {
+							picker.cursor = (picker.cursor + 1).min(total - 1);
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('k') | KeyCode::Up => {
+						picker.cursor = picker.cursor.saturating_sub(1);
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char('G') | KeyCode::End => {
+						if total > 0 {
+							picker.cursor = total - 1;
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Home => {
+						picker.cursor = 0;
+						Some(InputAction::Redraw)
+					}
+					KeyCode::Char(c @ '1'..='9') => {
+						let idx = (c as usize) - ('1' as usize);
+						if idx < total {
+							picker.cursor = idx;
+							return self.activate_picker_selection();
+						}
+						None
+					}
+					KeyCode::Enter | KeyCode::Char(' ') => self.activate_picker_selection(),
+					_ => None
+				}
+			}
+		}
+	}
+
+	fn activate_selected_toc_entry(&mut self) -> Option<InputAction> {
+		let item = self.toc.flat.get(self.toc.cursor).cloned()?;
+		self.overlay = Overlay::None;
+		self.last_render.rect = Rect::default();
+		if let Some(target_page) = item.page {
+			return self.jump_with_history(MarkPos {
+				page: target_page,
+				pan_left: 0,
+				pan_top: 0
+			});
+		}
+		if let Some(uri) = item.uri {
+			let _ = open_external_uri(&uri);
+			self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+				"Opened URI: {uri}"
+			))));
+		}
+		Some(InputAction::Redraw)
+	}
+
+	fn activate_picker_selection(&mut self) -> Option<InputAction> {
+		let Overlay::Picker(ref picker) = self.overlay else {
+			return None;
+		};
+		let item = picker.items.get(picker.cursor).cloned()?;
+		let kind = picker.kind.clone();
+		self.overlay = Overlay::None;
+		self.last_render.rect = Rect::default();
+
+		match kind {
+			PickerKind::Bookmarks => {
+				if let Some(page) = item.target_page {
+					return self.jump_with_history(MarkPos {
+						page,
+						pan_left: 0,
+						pan_top: 0
+					});
+				}
+				Some(InputAction::Redraw)
+			}
+			PickerKind::JumpList => {
+				if let Some(pos) = item.mark_pos {
+					return self.apply_mark_pos(pos);
+				}
+				Some(InputAction::Redraw)
+			}
+			PickerKind::Links(action) => self.execute_link_action(
+				action,
+				item.target_page,
+				item.uri.as_deref().unwrap_or_default()
+			)
+		}
+	}
+
+	fn execute_link_action(
+		&mut self,
+		action: LinkActionKind,
+		dest_page: Option<usize>,
+		uri: &str
+	) -> Option<InputAction> {
+		match action {
+			LinkActionKind::Follow => {
+				if let Some(page) = dest_page {
+					return self.jump_with_history(MarkPos {
+						page,
+						pan_left: 0,
+						pan_top: 0
+					});
+				}
+				if !uri.is_empty() {
+					if let Err(e) = open_external_uri(uri) {
+						self.set_msg(MessageSetting::Some(BottomMessage::Error(e)));
+					} else {
+						self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+							"Opened link: {uri}"
+						))));
+					}
+				}
+				Some(InputAction::Redraw)
+			}
+			LinkActionKind::Display => {
+				let desc = match (dest_page, uri.is_empty()) {
+					(Some(p), false) => format!("Link -> Page {} ({uri})", p + 1),
+					(Some(p), true) => format!("Link -> Page {}", p + 1),
+					(None, _) => format!("Link -> {uri}")
+				};
+				self.set_msg(MessageSetting::Some(BottomMessage::Info(desc)));
+				Some(InputAction::Redraw)
+			}
+			LinkActionKind::Copy => {
+				let text = if !uri.is_empty() {
+					uri.to_string()
+				} else if let Some(p) = dest_page {
+					format!("page:{}", p + 1)
+				} else {
+					String::new()
+				};
+				let _ = copy_to_clipboard(&text, is_tmux());
+				self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+					"Copied link: {text}"
+				))));
+				Some(InputAction::Redraw)
+			}
+		}
+	}
+
+	fn trigger_link_mode(&mut self, action: LinkActionKind) -> Option<InputAction> {
+		let shown = self.last_render.pages_shown.max(1);
+		let mut visible_links = Vec::new();
+		for p_idx in self.page..(self.page + shown).min(self.rendered.len()) {
+			for link in &self.rendered[p_idx].links {
+				visible_links.push(link.clone());
+			}
 		}
 
+		if visible_links.is_empty() {
+			self.set_msg(MessageSetting::Some(BottomMessage::Info(
+				"No links on current page".to_string()
+			)));
+			return Some(InputAction::Redraw);
+		}
+
+		if visible_links.len() == 1 {
+			let l = &visible_links[0];
+			return self.execute_link_action(action, l.dest_page, &l.uri);
+		}
+
+		let title = match action {
+			LinkActionKind::Follow => "Follow Link (1-9 or Enter)",
+			LinkActionKind::Display => "Display Link Target (1-9 or Enter)",
+			LinkActionKind::Copy => "Copy Link Target (1-9 or Enter)"
+		}
+		.to_string();
+
+		let items = visible_links
+			.into_iter()
+			.enumerate()
+			.map(|(idx, l)| {
+				let target_desc = match (l.dest_page, l.uri.is_empty()) {
+					(Some(p), _) => format!("Page {}", p + 1),
+					(None, false) => l.uri.clone(),
+					(None, true) => "(unknown)".to_string()
+				};
+				PickerItem {
+					label: format!("[{}] (p.{}) -> {}", idx + 1, l.page + 1, target_desc),
+					target_page: l.dest_page,
+					uri: Some(l.uri),
+					mark_pos: None
+				}
+			})
+			.collect();
+
+		self.overlay = Overlay::Picker(ListPickerState {
+			title,
+			kind: PickerKind::Links(action),
+			items,
+			cursor: 0
+		});
+		self.last_render.rect = Rect::default();
+		Some(InputAction::Redraw)
+	}
+
+	fn logical_to_zero_page(&self, logical_input: usize) -> Option<usize> {
+		let phys_one_based = (logical_input as i32) + self.state.page_offset;
+		if phys_one_based < 1 {
+			return None;
+		}
+		let zero_page = (phys_one_based as usize) - 1;
+		(zero_page < self.rendered.len()).then_some(zero_page)
+	}
+
+	fn search_step(&mut self, forward: bool) -> Option<InputAction> {
+		if self.rendered.is_empty() {
+			return None;
+		}
+		if forward {
+			if self.page >= self.rendered.len() - 1 {
+				return None;
+			}
+			self.rendered[(self.page + 1)..]
+				.iter()
+				.enumerate()
+				.find_map(|(idx, p)| {
+					p.num_results
+						.is_some_and(|num| num > 0)
+						.then_some(self.page + 1 + idx)
+				})
+				.and_then(|next_page| {
+					self.jump_with_history(MarkPos {
+						page: next_page,
+						pan_left: 0,
+						pan_top: 0
+					})
+				})
+		} else {
+			if self.page == 0 {
+				return None;
+			}
+			self.rendered[..self.page]
+				.iter()
+				.rev()
+				.enumerate()
+				.find_map(|(idx, p)| {
+					p.num_results
+						.is_some_and(|num| num > 0)
+						.then_some(self.page - (idx + 1))
+				})
+				.and_then(|prev_page| {
+					self.jump_with_history(MarkPos {
+						page: prev_page,
+						pan_left: 0,
+						pan_top: 0
+					})
+				})
+		}
+	}
+
+	fn execute_colon_command(&mut self, raw: &str) -> Option<InputAction> {
+		let trimmed = raw.trim();
+		if trimmed.is_empty() {
+			return Some(InputAction::Redraw);
+		}
+		if let Ok(page_num) = trimmed.parse::<usize>() {
+			if let Some(zero_page) = self.logical_to_zero_page(page_num) {
+				return self.jump_with_history(MarkPos {
+					page: zero_page,
+					pan_left: 0,
+					pan_top: 0
+				});
+			}
+			self.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+				"Page {page_num} is out of range"
+			))));
+			return Some(InputAction::Redraw);
+		}
+
+		let (cmd, arg) = trimmed
+			.split_once(char::is_whitespace)
+			.map_or((trimmed, ""), |(c, a)| (c, a.trim()));
+
+		match cmd {
+			"q" | "quit" | "close" => Some(InputAction::QuitApp),
+			"help" | "h" => {
+				self.overlay = Overlay::Help;
+				self.last_render.rect = Rect::default();
+				Some(InputAction::Redraw)
+			}
+			"info" => {
+				self.overlay = Overlay::Info;
+				self.last_render.rect = Rect::default();
+				Some(InputAction::Redraw)
+			}
+			"reload" | "e" => Some(InputAction::Reload),
+			"yank" | "y" => Some(InputAction::ExtractPageText {
+				page: self.page,
+				open_visual: false
+			}),
+			"nohlsearch" | "nohl" => {
+				for img in &mut self.rendered {
+					img.num_results = None;
+				}
+				self.set_msg(MessageSetting::Reset);
+				Some(InputAction::Search(String::new()))
+			}
+			"hlsearch" => {
+				if self.last_search_term.is_empty() {
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(
+						"No previous search term".to_string()
+					)));
+					Some(InputAction::Redraw)
+				} else {
+					let term = self.last_search_term.clone();
+					for img in &mut self.rendered {
+						img.num_results = None;
+					}
+					self.set_msg(MessageSetting::Some(BottomMessage::SearchResults(
+						term.clone()
+					)));
+					Some(InputAction::Search(term))
+				}
+			}
+			"offset" => {
+				if arg.is_empty() {
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+						"Current page offset: {}",
+						self.state.page_offset
+					))));
+				} else if let Ok(off) = arg.parse::<i32>() {
+					self.state.page_offset = off;
+					self.save_state();
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+						"Page offset set to {off}"
+					))));
+				} else {
+					self.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+						"Invalid integer offset: '{arg}'"
+					))));
+				}
+				Some(InputAction::Redraw)
+			}
+			"bmark" => {
+				if arg.is_empty() {
+					self.set_msg(MessageSetting::Some(BottomMessage::Error(
+						"Usage: :bmark <name>".to_string()
+					)));
+				} else {
+					self.state.set_bookmark(arg.to_string(), self.page);
+					self.save_state();
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+						"Bookmark '{arg}' saved at page {}",
+						self.page + 1
+					))));
+				}
+				Some(InputAction::Redraw)
+			}
+			"bdelete" | "bdel" => {
+				if arg.is_empty() {
+					self.set_msg(MessageSetting::Some(BottomMessage::Error(
+						"Usage: :bdelete <name>".to_string()
+					)));
+				} else if self.state.delete_bookmark(arg) {
+					self.save_state();
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+						"Deleted bookmark '{arg}'"
+					))));
+				} else {
+					self.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+						"Bookmark '{arg}' not found"
+					))));
+				}
+				Some(InputAction::Redraw)
+			}
+			"bjump" => {
+				if let Some(target_page) = self.state.get_bookmark(arg) {
+					return self.jump_with_history(MarkPos {
+						page: target_page,
+						pan_left: 0,
+						pan_top: 0
+					});
+				}
+				self.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+					"Bookmark '{arg}' not found"
+				))));
+				Some(InputAction::Redraw)
+			}
+			"blist" | "bookmarks" => {
+				if self.state.bookmarks.is_empty() {
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(
+						"No bookmarks saved for this document".to_string()
+					)));
+					return Some(InputAction::Redraw);
+				}
+				let items = self
+					.state
+					.bookmarks
+					.iter()
+					.enumerate()
+					.map(|(idx, (name, p))| PickerItem {
+						label: format!("[{}] {name} -> Page {}", idx + 1, p + 1),
+						target_page: Some(*p),
+						uri: None,
+						mark_pos: None
+					})
+					.collect();
+				self.overlay = Overlay::Picker(ListPickerState {
+					title: "Bookmarks (Enter to jump)".to_string(),
+					kind: PickerKind::Bookmarks,
+					items,
+					cursor: 0
+				});
+				self.last_render.rect = Rect::default();
+				Some(InputAction::Redraw)
+			}
+			"jumplist" | "jumps" => {
+				let entries = self.jumplist.entries();
+				if entries.is_empty() {
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(
+						"Jumplist is empty".to_string()
+					)));
+					return Some(InputAction::Redraw);
+				}
+				let items = entries
+					.iter()
+					.enumerate()
+					.rev()
+					.map(|(idx, pos)| PickerItem {
+						label: format!(
+							"#{}: Page {} (pan {},{})",
+							idx + 1,
+							pos.page + 1,
+							pos.pan_left,
+							pos.pan_top
+						),
+						target_page: Some(pos.page),
+						uri: None,
+						mark_pos: Some(*pos)
+					})
+					.collect();
+				self.overlay = Overlay::Picker(ListPickerState {
+					title: "Jumplist (most recent first)".to_string(),
+					kind: PickerKind::JumpList,
+					items,
+					cursor: 0
+				});
+				self.last_render.rect = Rect::default();
+				Some(InputAction::Redraw)
+			}
+			"mark" => {
+				if let Some(ch) = arg.chars().next()
+					&& ch.is_ascii_alphanumeric()
+				{
+					let pos = self.current_mark_pos();
+					self.state.set_mark(ch, pos);
+					self.save_state();
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+						"Mark '{ch}' set at page {}",
+						self.page + 1
+					))));
+				} else {
+					self.set_msg(MessageSetting::Some(BottomMessage::Error(
+						"Usage: :mark <a-zA-Z0-9>".to_string()
+					)));
+				}
+				Some(InputAction::Redraw)
+			}
+			"delmarks" | "delm" => {
+				if arg.is_empty() {
+					self.set_msg(MessageSetting::Some(BottomMessage::Error(
+						"Usage: :delmarks <chars> or :delmarks !".to_string()
+					)));
+				} else {
+					let removed = self.state.delete_marks(arg);
+					self.save_state();
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+						"Deleted {removed} mark(s)"
+					))));
+				}
+				Some(InputAction::Redraw)
+			}
+			_ => {
+				self.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+					"Unknown command: :{trimmed}"
+				))));
+				Some(InputAction::Redraw)
+			}
+		}
+	}
+
+	fn zoom_in(&mut self) -> Option<InputAction> {
+		if !self.is_kitty {
+			return None;
+		}
+		if self.zoom.is_some() {
+			self.update_zoom(Zoom::step_in)
+		} else {
+			self.zoom = Some(Zoom {
+				level: 1,
+				..Zoom::default()
+			});
+			self.last_render.rect = Rect::default();
+			self.save_state();
+			Some(InputAction::SwitchRenderZoom(FitOrFill::Fill))
+		}
+	}
+
+	fn zoom_out(&mut self) -> Option<InputAction> {
+		if !self.is_kitty {
+			return None;
+		}
+		if self.zoom.is_some() {
+			self.update_zoom(Zoom::step_out)
+		} else {
+			None
+		}
+	}
+
+	fn zoom_original(&mut self) -> Option<InputAction> {
+		if !self.is_kitty {
+			return None;
+		}
+		if self.zoom.is_some() {
+			self.update_zoom(Zoom::reset_level)
+		} else {
+			self.zoom = Some(Zoom::default());
+			self.last_render.rect = Rect::default();
+			self.save_state();
+			Some(InputAction::SwitchRenderZoom(FitOrFill::Fill))
+		}
+	}
+
+	pub fn handle_event(&mut self, ev: &Event) -> Option<InputAction> {
 		let can_zoom = self.is_kitty && self.zoom.is_some();
 
 		match ev {
 			Event::Key(key) => {
-				match key.code {
-					KeyCode::Char(c)
-						if let BottomMessage::Input(InputCommand::Search(ref mut term)) =
-							self.bottom_msg =>
-					{
-						term.push(c);
-						InputAction::Redraw.into()
-					}
-					KeyCode::Char(c)
-						if let BottomMessage::Input(InputCommand::GoToPage(_)) =
-							self.bottom_msg && matches!(c, 'g' if self.is_kitty) =>
-					{
+				if !matches!(self.overlay, Overlay::None) {
+					return self.handle_overlay_key(key.code, key.modifiers);
+				}
+
+				let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+				let alt = key.modifiers.contains(KeyModifiers::ALT);
+				let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+				let is_abort = matches!(key.code, KeyCode::Esc)
+					|| (ctrl && matches!(key.code, KeyCode::Char('c' | '[')));
+
+				if is_abort {
+					self.num_prefix = None;
+					self.pending_prefix = PendingPrefix::None;
+					if matches!(self.bottom_msg, BottomMessage::Input(_)) {
 						self.set_msg(MessageSetting::Pop);
-						self.update_zoom(Zoom::pan_bottom)
+						return Some(InputAction::Redraw);
 					}
-					KeyCode::Char(c)
-						if let BottomMessage::Input(InputCommand::GoToPage(ref mut page)) =
-							self.bottom_msg =>
-						c.to_digit(10).map(|input_num| {
-							*page = (*page * 10) + input_num as usize;
-							InputAction::Redraw
-						}),
+					if matches!(self.bottom_msg, BottomMessage::SearchResults(_)) {
+						for img in &mut self.rendered {
+							img.num_results = None;
+						}
+						self.set_msg(MessageSetting::Reset);
+						return Some(InputAction::Search(String::new()));
+					}
+					self.set_msg(MessageSetting::Reset);
+					return Some(InputAction::Redraw);
+				}
+
+				if matches!(self.bottom_msg, BottomMessage::Input(_)) {
+					return self.handle_inputbar_key(key.code, ctrl);
+				}
+
+				if self.pending_prefix != PendingPrefix::None {
+					let pending = self.pending_prefix;
+					self.pending_prefix = PendingPrefix::None;
+					let count = self.num_prefix.take();
+					return match (pending, key.code) {
+						(PendingPrefix::G, KeyCode::Char('g')) => {
+							if let Some(target_n) = count {
+								if let Some(zero_page) = self.logical_to_zero_page(target_n) {
+									self.jump_with_history(MarkPos {
+										page: zero_page,
+										pan_left: 0,
+										pan_top: 0
+									})
+								} else {
+									self.set_msg(MessageSetting::Some(BottomMessage::Error(
+										format!("Page {target_n} is out of range")
+									)));
+									Some(InputAction::Redraw)
+								}
+							} else {
+								self.jump_with_history(MarkPos {
+									page: 0,
+									pan_left: 0,
+									pan_top: 0
+								})
+							}
+						}
+						(PendingPrefix::G, KeyCode::Char('v')) => Some(
+							InputAction::ExtractPageText {
+								page: self.page,
+								open_visual: true
+							}
+						),
+						(PendingPrefix::Z, KeyCode::Char('i' | 'I')) => self.zoom_in(),
+						(PendingPrefix::Z, KeyCode::Char('o' | 'O')) => self.zoom_out(),
+						(PendingPrefix::Z, KeyCode::Char('0' | 'z' | 'Z')) => self.zoom_original(),
+						_ => Some(InputAction::Redraw)
+					};
+				}
+
+				if !ctrl
+					&& !alt
+					&& let KeyCode::Char(c) = key.code
+					&& let Some(digit) = c.to_digit(10)
+					&& (digit > 0 || self.num_prefix.is_some())
+				{
+					let cur = self.num_prefix.unwrap_or(0);
+					self.num_prefix = Some(cur.saturating_mul(10).saturating_add(digit as usize));
+					return Some(InputAction::Redraw);
+				}
+
+				let count = self.num_prefix.take();
+
+				match key.code {
+					KeyCode::Tab => {
+						if self.toc.roots.is_empty() {
+							self.set_msg(MessageSetting::Some(BottomMessage::Info(
+								"Document has no Table of Contents (outline)".to_string()
+							)));
+						} else {
+							self.toc.sync_to_page(self.page);
+							self.overlay = Overlay::Index;
+							self.last_render.rect = Rect::default();
+						}
+						Some(InputAction::Redraw)
+					}
+					KeyCode::F(1) => {
+						self.overlay = Overlay::Help;
+						self.last_render.rect = Rect::default();
+						Some(InputAction::Redraw)
+					}
+					KeyCode::F(5 | 11) => Some(InputAction::Fullscreen),
+					KeyCode::Char('n') if ctrl => Some(InputAction::Fullscreen),
+					KeyCode::Char('o') if ctrl => {
+						let cur = self.current_mark_pos();
+						if let Some(prev) = self.jumplist.go_back(cur) {
+							self.apply_mark_pos(prev)
+						} else {
+							self.set_msg(MessageSetting::Some(BottomMessage::Info(
+								"At oldest jump in jumplist".to_string()
+							)));
+							Some(InputAction::Redraw)
+						}
+					}
+					KeyCode::Char('i') if ctrl => {
+						let cur = self.current_mark_pos();
+						if let Some(next) = self.jumplist.go_forward(cur) {
+							self.apply_mark_pos(next)
+						} else {
+							self.set_msg(MessageSetting::Some(BottomMessage::Info(
+								"At newest jump in jumplist".to_string()
+							)));
+							Some(InputAction::Redraw)
+						}
+					}
+					KeyCode::Char('j') if ctrl => {
+						let total = self.rendered.len();
+						if let Some((target, low, high)) =
+							self.bisect.step(self.page, total, true)
+						{
+							let cur = self.current_mark_pos();
+							self.jumplist.record(cur);
+							self.set_page(target);
+							self.save_state();
+							self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+								"Bisect -> page {} (range {}..{})",
+								target + 1,
+								low + 1,
+								high + 1
+							))));
+							Some(InputAction::JumpingToPage(target))
+						} else {
+							None
+						}
+					}
+					KeyCode::Char('k') if ctrl => {
+						let total = self.rendered.len();
+						if let Some((target, low, high)) =
+							self.bisect.step(self.page, total, false)
+						{
+							let cur = self.current_mark_pos();
+							self.jumplist.record(cur);
+							self.set_page(target);
+							self.save_state();
+							self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+								"Bisect -> page {} (range {}..{})",
+								target + 1,
+								low + 1,
+								high + 1
+							))));
+							Some(InputAction::JumpingToPage(target))
+						} else {
+							None
+						}
+					}
+					KeyCode::Char('d') if ctrl => {
+						if can_zoom {
+							if self
+								.zoom
+								.is_some_and(|z| z.cell_pan_from_top >= z.max_pan_top)
+							{
+								self.change_page(PageChange::Next, ChangeAmount::Single, 1)
+							} else {
+								self.update_zoom(|z| z.pan_by(Direction::Down, Zoom::PAN_STEP_Y * 2))
+							}
+						} else {
+							self.change_page(
+								PageChange::Next,
+								ChangeAmount::Single,
+								count.unwrap_or(1)
+							)
+						}
+					}
+					KeyCode::Char('u') if ctrl => {
+						if can_zoom {
+							if self.zoom.is_some_and(|z| z.cell_pan_from_top == 0) {
+								self.change_page(PageChange::Prev, ChangeAmount::Single, 1)
+							} else {
+								self.update_zoom(|z| z.pan_by(Direction::Up, Zoom::PAN_STEP_Y * 2))
+							}
+						} else {
+							self.change_page(
+								PageChange::Prev,
+								ChangeAmount::Single,
+								count.unwrap_or(1)
+							)
+						}
+					}
+					KeyCode::Char('f') if ctrl => self.change_page(
+						PageChange::Next,
+						ChangeAmount::WholeScreen,
+						count.unwrap_or(1)
+					),
+					KeyCode::Char('b') if ctrl => self.change_page(
+						PageChange::Prev,
+						ChangeAmount::WholeScreen,
+						count.unwrap_or(1)
+					),
+					KeyCode::Char('t') if ctrl => {
+						if can_zoom {
+							self.update_zoom(|z| z.pan_by(Direction::Left, Zoom::PAN_STEP_X * 2))
+						} else {
+							None
+						}
+					}
+					KeyCode::Char('y') if ctrl => {
+						if can_zoom {
+							self.update_zoom(|z| z.pan_by(Direction::Right, Zoom::PAN_STEP_X * 2))
+						} else {
+							None
+						}
+					}
+					KeyCode::Char('r') if ctrl => {
+						self.state.invert = !self.state.invert;
+						self.save_state();
+						Some(InputAction::Invert)
+					}
 					KeyCode::Char(c) => match c {
-						'L' => self.change_page(PageChange::Next, ChangeAmount::Single),
-						'J' => self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
-						'H' => self.change_page(PageChange::Prev, ChangeAmount::Single),
-						'K' => self.change_page(PageChange::Prev, ChangeAmount::WholeScreen),
 						'q' => Some(InputAction::QuitApp),
 						'g' => {
+							self.num_prefix = count;
+							self.pending_prefix = PendingPrefix::G;
+							Some(InputAction::Redraw)
+						}
+						'z' => {
+							self.num_prefix = count;
+							self.pending_prefix = PendingPrefix::Z;
+							Some(InputAction::Redraw)
+						}
+						'G' => {
+							if let Some(target_n) = count {
+								if let Some(zero_page) = self.logical_to_zero_page(target_n) {
+									self.jump_with_history(MarkPos {
+										page: zero_page,
+										pan_left: 0,
+										pan_top: 0
+									})
+								} else {
+									self.set_msg(MessageSetting::Some(BottomMessage::Error(
+										format!("Page {target_n} is out of range")
+									)));
+									Some(InputAction::Redraw)
+								}
+							} else {
+								let last = self.rendered.len().saturating_sub(1);
+								self.jump_with_history(MarkPos {
+									page: last,
+									pan_left: 0,
+									pan_top: 0
+								})
+							}
+						}
+						'J' => self.change_page(
+							PageChange::Next,
+							ChangeAmount::Single,
+							count.unwrap_or(1)
+						),
+						'K' => self.change_page(
+							PageChange::Prev,
+							ChangeAmount::Single,
+							count.unwrap_or(1)
+						),
+						' ' => {
+							if shift {
+								self.change_page(
+									PageChange::Prev,
+									ChangeAmount::WholeScreen,
+									count.unwrap_or(1)
+								)
+							} else {
+								self.change_page(
+									PageChange::Next,
+									ChangeAmount::WholeScreen,
+									count.unwrap_or(1)
+								)
+							}
+						}
+						'H' => {
+							if can_zoom {
+								self.update_zoom(Zoom::pan_page_top)
+							} else {
+								None
+							}
+						}
+						'L' => {
+							if can_zoom {
+								self.update_zoom(Zoom::pan_page_bottom)
+							} else {
+								None
+							}
+						}
+						'P' => {
+							if can_zoom {
+								self.update_zoom(|z| {
+									z.pan_page_top();
+									z.pan_left();
+								})
+							} else {
+								None
+							}
+						}
+						't' => {
+							if can_zoom {
+								self.update_zoom(Zoom::pan_left)
+							} else {
+								None
+							}
+						}
+						'y' => {
+							if can_zoom {
+								self.update_zoom(Zoom::pan_right)
+							} else {
+								Some(InputAction::ExtractPageText {
+									page: self.page,
+									open_visual: false
+								})
+							}
+						}
+						'Y' => {
+							let path_str = self.file_path.to_string_lossy().to_string();
+							let _ = copy_to_clipboard(&path_str, is_tmux());
+							self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+								"Copied filepath: {path_str}"
+							))));
+							Some(InputAction::Redraw)
+						}
+						':' => {
 							self.set_msg(MessageSetting::Some(BottomMessage::Input(
-								InputCommand::GoToPage(0)
+								InputCommand::Command(String::new())
+							)));
+							Some(InputAction::Redraw)
+						}
+						'm' => {
+							self.set_msg(MessageSetting::Some(BottomMessage::Input(
+								InputCommand::MarkSet
+							)));
+							Some(InputAction::Redraw)
+						}
+						'\'' => {
+							self.set_msg(MessageSetting::Some(BottomMessage::Input(
+								InputCommand::MarkJump
 							)));
 							Some(InputAction::Redraw)
 						}
 						'/' => {
 							self.set_msg(MessageSetting::Some(BottomMessage::Input(
-								InputCommand::Search(String::new())
+								InputCommand::Search {
+									term: String::new(),
+									backward: false
+								}
 							)));
 							Some(InputAction::Redraw)
 						}
-						'i' => Some(InputAction::Invert),
 						'?' => {
-							self.showing_help_msg = true;
+							self.set_msg(MessageSetting::Some(BottomMessage::Input(
+								InputCommand::Search {
+									term: String::new(),
+									backward: true
+								}
+							)));
 							Some(InputAction::Redraw)
 						}
-						'f' => Some(InputAction::Fullscreen),
-						// TODO: If we can't find one, then maybe like block until we've verified
-						// all the pages have been checked?
-						'n' if self.page < self.rendered.len() - 1 => self.rendered
-							[(self.page + 1)..]
-							.iter()
-							.enumerate()
-							.find_map(|(idx, p)| {
-								p.num_results
-									.is_some_and(|num| num > 0)
-									.then_some(self.page + 1 + idx)
-							})
-							.map(|next_page| {
-								jump_to_page(&mut self.page, &mut self.last_render.rect, next_page)
-							}),
-						'N' if self.page > 0 => self.rendered[..(self.page)]
-							.iter()
-							.rev()
-							.enumerate()
-							.find_map(|(idx, p)| {
-								p.num_results
-									.is_some_and(|num| num > 0)
-									.then_some(self.page - (idx + 1))
-							})
-							.map(|prev_page| {
-								jump_to_page(&mut self.page, &mut self.last_render.rect, prev_page)
-							}),
-						'z' if key.modifiers.contains(KeyModifiers::CONTROL) => {
-							// [todo] better error handling here?
-
-							let mut backend = stdout();
-							execute!(
-								&mut backend,
-								LeaveAlternateScreen,
-								crossterm::cursor::Show,
-								crossterm::event::DisableMouseCapture
-							)
-							.unwrap();
-							disable_raw_mode().unwrap();
-
-							#[cfg(unix)]
-							{
-								// This process will hang after the SIGSTOP call until we get
-								// foregrounded again by something else, at which point we need to
-								// re-setup everything so that it all gets drawn again.
-								nix::sys::signal::kill(
-									nix::unistd::Pid::this(),
-									nix::sys::signal::Signal::SIGSTOP
-								)
-								.unwrap();
-							}
-
-							enable_raw_mode().unwrap();
-							execute!(
-								&mut backend,
-								EnterAlternateScreen,
-								crossterm::cursor::Hide,
-								crossterm::event::EnableMouseCapture
-							)
-							.unwrap();
-
-							self.last_render.rect = Rect::default();
-							Some(InputAction::Redraw)
-						}
-						'z' if self.is_kitty => {
-							let (zoom, f_or_f) = match self.zoom {
-								None => (Some(Zoom::default()), FitOrFill::Fill),
-								Some(_) => (None, FitOrFill::Fit)
+						'f' => self.trigger_link_mode(LinkActionKind::Follow),
+						'F' => self.trigger_link_mode(LinkActionKind::Display),
+						'c' => self.trigger_link_mode(LinkActionKind::Copy),
+						'v' | 'V' => Some(InputAction::ExtractPageText {
+							page: self.page,
+							open_visual: true
+						}),
+						'd' => {
+							let is_dual = self
+								.page_constraints
+								.max_wide
+								.is_some_and(|w| w.get() >= 2);
+							self.page_constraints.max_wide = if is_dual {
+								NonZeroUsize::new(1)
+							} else {
+								NonZeroUsize::new(2)
 							};
-							self.zoom = zoom;
+							if !is_dual {
+								self.zoom = None;
+							}
 							self.last_render.rect = Rect::default();
-							Some(InputAction::SwitchRenderZoom(f_or_f))
+							self.save_state();
+							Some(InputAction::SwitchRenderZoom(FitOrFill::Fit))
 						}
-						'o' if can_zoom => self.update_zoom(Zoom::step_in),
-						'O' if can_zoom => self.update_zoom(Zoom::step_out),
+						'w' => {
+							self.page_constraints.max_wide = NonZeroUsize::new(1);
+							self.last_render.rect = Rect::default();
+							self.save_state();
+							Some(InputAction::Redraw)
+						}
+						'D' => {
+							self.page_constraints.first_page_solo =
+								!self.page_constraints.first_page_solo;
+							self.last_render.rect = Rect::default();
+							self.save_state();
+							Some(InputAction::Redraw)
+						}
+						'R' => Some(InputAction::Reload),
+						'a' if self.is_kitty => {
+							self.zoom = None;
+							self.last_render.rect = Rect::default();
+							self.save_state();
+							Some(InputAction::SwitchRenderZoom(FitOrFill::Fit))
+						}
+						's' if self.is_kitty => {
+							if self.zoom.is_none() {
+								self.zoom = Some(Zoom::default());
+							}
+							self.last_render.rect = Rect::default();
+							self.save_state();
+							Some(InputAction::SwitchRenderZoom(FitOrFill::Fill))
+						}
+						'n' => self.search_step(!self.search_backward),
+						'N' => self.search_step(self.search_backward),
+						'+' => self.zoom_in(),
+						'-' => self.zoom_out(),
+						'=' => self.zoom_original(),
 						'l' if can_zoom => self.update_zoom(|z| z.pan(Direction::Right)),
 						'h' if can_zoom => self.update_zoom(|z| z.pan(Direction::Left)),
 						'j' if can_zoom =>
@@ -871,107 +2206,147 @@ impl Tui {
 								.zoom
 								.is_some_and(|z| z.cell_pan_from_top >= z.max_pan_top)
 							{
-								self.change_page(PageChange::Next, ChangeAmount::WholeScreen)
+								self.change_page(PageChange::Next, ChangeAmount::WholeScreen, 1)
 							} else {
 								self.update_zoom(|z| z.pan(Direction::Down))
 							},
 						'k' if can_zoom =>
 							if self.zoom.is_some_and(|z| z.cell_pan_from_top == 0) {
-								self.change_page(PageChange::Prev, ChangeAmount::WholeScreen)
+								self.change_page(PageChange::Prev, ChangeAmount::WholeScreen, 1)
 							} else {
 								self.update_zoom(|z| z.pan(Direction::Up))
 							},
-						'l' => self.change_page(PageChange::Next, ChangeAmount::Single),
-						'h' => self.change_page(PageChange::Prev, ChangeAmount::Single),
-						'j' => self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
-						'k' => self.change_page(PageChange::Prev, ChangeAmount::WholeScreen),
-						'G' if can_zoom => self.update_zoom(Zoom::pan_top),
+						'l' => self.change_page(
+							PageChange::Next,
+							ChangeAmount::Single,
+							count.unwrap_or(1)
+						),
+						'h' => self.change_page(
+							PageChange::Prev,
+							ChangeAmount::Single,
+							count.unwrap_or(1)
+						),
+						'j' => self.change_page(
+							PageChange::Next,
+							ChangeAmount::WholeScreen,
+							count.unwrap_or(1)
+						),
+						'k' => self.change_page(
+							PageChange::Prev,
+							ChangeAmount::WholeScreen,
+							count.unwrap_or(1)
+						),
 						'0' if can_zoom => self.update_zoom(Zoom::pan_left),
 						'$' if can_zoom => self.update_zoom(Zoom::pan_right),
-						'r' => Some(InputAction::Rotate),
+						'r' => {
+							self.state.rotate_steps = (self.state.rotate_steps + 1) % 4;
+							self.save_state();
+							Some(InputAction::Rotate)
+						}
 						_ => None
 					},
-					KeyCode::Backspace
-						if let BottomMessage::Input(InputCommand::Search(ref mut term)) =
-							self.bottom_msg =>
-					{
-						term.pop();
-						InputAction::Redraw.into()
+					KeyCode::Backspace => self.change_page(
+						PageChange::Prev,
+						ChangeAmount::WholeScreen,
+						count.unwrap_or(1)
+					),
+					KeyCode::Home => self.jump_with_history(MarkPos {
+						page: 0,
+						pan_left: 0,
+						pan_top: 0
+					}),
+					KeyCode::End => {
+						let last = self.rendered.len().saturating_sub(1);
+						self.jump_with_history(MarkPos {
+							page: last,
+							pan_left: 0,
+							pan_top: 0
+						})
 					}
-					KeyCode::Right => self.change_page(PageChange::Next, ChangeAmount::Single),
-					KeyCode::Down | KeyCode::PageDown =>
-						self.change_page(PageChange::Next, ChangeAmount::WholeScreen),
-					KeyCode::Left => self.change_page(PageChange::Prev, ChangeAmount::Single),
-					KeyCode::Up | KeyCode::PageUp =>
-						self.change_page(PageChange::Prev, ChangeAmount::WholeScreen),
-					KeyCode::Esc => match (self.showing_help_msg, &self.bottom_msg) {
-						(false, BottomMessage::Help) => Some(InputAction::QuitApp),
-						_ => {
-							// When we hit escape, we just want to pop off the current message and
-							// show the underlying one.
-							self.set_msg(MessageSetting::Pop);
-							Some(InputAction::Redraw)
+					KeyCode::PageDown => self.change_page(
+						PageChange::Next,
+						ChangeAmount::Single,
+						count.unwrap_or(1)
+					),
+					KeyCode::PageUp => self.change_page(
+						PageChange::Prev,
+						ChangeAmount::Single,
+						count.unwrap_or(1)
+					),
+					KeyCode::Right => {
+						if alt {
+							self.change_page(
+								PageChange::Next,
+								ChangeAmount::Single,
+								count.unwrap_or(1)
+							)
+						} else if can_zoom {
+							self.update_zoom(|z| z.pan(Direction::Right))
+						} else {
+							self.change_page(
+								PageChange::Next,
+								ChangeAmount::Single,
+								count.unwrap_or(1)
+							)
 						}
-					},
-					KeyCode::Enter => {
-						let mut default = BottomMessage::default();
-						std::mem::swap(&mut self.bottom_msg, &mut default);
-						let BottomMessage::Input(ref cmd) = default else {
-							std::mem::swap(&mut self.bottom_msg, &mut default);
-							return None;
-						};
-
-						match cmd {
-							// Only forward the command if it's within range
-							InputCommand::GoToPage(page) => {
-								// We need to subtract 1 b/c they're tracked internally as
-								// 0-indexed but input and displayed as 1-indexed
-								let zero_page = page.saturating_sub(1);
-								let rendered_len = self.rendered.len();
-
-								if zero_page < rendered_len {
-									self.set_page(zero_page);
-									Some(InputAction::JumpingToPage(zero_page))
-								} else {
-									self.set_msg(MessageSetting::Some(BottomMessage::Error(
-										format!(
-											"Cannot jump to page {page}; there are only {rendered_len} pages in the document"
-										)
-									)));
-									Some(InputAction::Redraw)
-								}
+					}
+					KeyCode::Left => {
+						if alt {
+							self.change_page(
+								PageChange::Prev,
+								ChangeAmount::Single,
+								count.unwrap_or(1)
+							)
+						} else if can_zoom {
+							self.update_zoom(|z| z.pan(Direction::Left))
+						} else {
+							self.change_page(
+								PageChange::Prev,
+								ChangeAmount::Single,
+								count.unwrap_or(1)
+							)
+						}
+					}
+					KeyCode::Down => {
+						if can_zoom {
+							if self
+								.zoom
+								.is_some_and(|z| z.cell_pan_from_top >= z.max_pan_top)
+							{
+								self.change_page(PageChange::Next, ChangeAmount::WholeScreen, 1)
+							} else {
+								self.update_zoom(|z| z.pan(Direction::Down))
 							}
-							InputCommand::Search(term) => {
-								let term = term.clone();
-
-								// We only want to show search results if there would actually be
-								// data to show
-								if !term.is_empty() {
-									self.set_msg(MessageSetting::Some(
-										BottomMessage::SearchResults(term.clone())
-									));
-								} else {
-									// else, if it's not empty, we just want to reset the bottom
-									// area to show the default data; we don't want it to like show
-									// the data from a previous search
-									self.set_msg(MessageSetting::Reset);
-								}
-
-								// Reset all the search results
-								for img in &mut self.rendered {
-									img.num_results = None;
-								}
-								// but we still want to tell the rest of the system that we set the
-								// search term to '' so that they can re-render the pages wthout
-								// the highlighting
-								Some(InputAction::Search(term))
+						} else {
+							self.change_page(
+								PageChange::Next,
+								ChangeAmount::WholeScreen,
+								count.unwrap_or(1)
+							)
+						}
+					}
+					KeyCode::Up => {
+						if can_zoom {
+							if self.zoom.is_some_and(|z| z.cell_pan_from_top == 0) {
+								self.change_page(PageChange::Prev, ChangeAmount::WholeScreen, 1)
+							} else {
+								self.update_zoom(|z| z.pan(Direction::Up))
 							}
+						} else {
+							self.change_page(
+								PageChange::Prev,
+								ChangeAmount::WholeScreen,
+								count.unwrap_or(1)
+							)
 						}
 					}
 					_ => None
 				}
 			}
 			Event::Mouse(mouse) => {
+				if !matches!(self.overlay, Overlay::None) {
+					return None;
+				}
 				let mut handle_scroll = |mut direction: Direction| {
 					if can_zoom {
 						if mouse.modifiers.contains(KeyModifiers::CONTROL) {
@@ -993,7 +2368,7 @@ impl Tui {
 							Direction::Left => (PageChange::Prev, ChangeAmount::Single),
 							Direction::Up => (PageChange::Prev, ChangeAmount::WholeScreen)
 						};
-						self.change_page(change, amount)
+						self.change_page(change, amount, 1)
 					}
 				};
 				match mouse.kind {
@@ -1009,13 +2384,154 @@ impl Tui {
 		}
 	}
 
-	// I want this to always return an option 'cause I just use it to return from `Self::handle_event`
+	fn handle_inputbar_key(&mut self, code: KeyCode, ctrl: bool) -> Option<InputAction> {
+		match code {
+			KeyCode::Tab
+				if let BottomMessage::Input(InputCommand::Command(ref mut cmd)) =
+					self.bottom_msg =>
+			{
+				if let Some(completed) = complete_command(cmd, &self.state.bookmarks) {
+					*cmd = completed;
+				}
+				Some(InputAction::Redraw)
+			}
+			KeyCode::Char('h') if ctrl => {
+				if let BottomMessage::Input(
+					InputCommand::Search {
+						term: ref mut s, ..
+					}
+					| InputCommand::Command(ref mut s)
+				) = self.bottom_msg
+				{
+					s.pop();
+				}
+				Some(InputAction::Redraw)
+			}
+			KeyCode::Char('u') if ctrl => {
+				if let BottomMessage::Input(
+					InputCommand::Search {
+						term: ref mut s, ..
+					}
+					| InputCommand::Command(ref mut s)
+				) = self.bottom_msg
+				{
+					s.clear();
+				}
+				Some(InputAction::Redraw)
+			}
+			KeyCode::Char('w') if ctrl => {
+				if let BottomMessage::Input(
+					InputCommand::Search {
+						term: ref mut s, ..
+					}
+					| InputCommand::Command(ref mut s)
+				) = self.bottom_msg
+				{
+					let trimmed = s.trim_end();
+					let new_len = trimmed
+						.rfind(char::is_whitespace)
+						.map_or(0, |idx| idx + 1);
+					s.truncate(new_len);
+				}
+				Some(InputAction::Redraw)
+			}
+			KeyCode::Backspace => {
+				if let BottomMessage::Input(
+					InputCommand::Search {
+						term: ref mut s, ..
+					}
+					| InputCommand::Command(ref mut s)
+				) = self.bottom_msg
+				{
+					s.pop();
+				}
+				Some(InputAction::Redraw)
+			}
+			KeyCode::Char(c)
+				if matches!(self.bottom_msg, BottomMessage::Input(InputCommand::MarkSet)) =>
+			{
+				self.set_msg(MessageSetting::Pop);
+				if c.is_ascii_alphanumeric() {
+					let pos = self.current_mark_pos();
+					self.state.set_mark(c, pos);
+					self.save_state();
+					self.set_msg(MessageSetting::Some(BottomMessage::Info(format!(
+						"Mark '{c}' set at page {}",
+						self.page + 1
+					))));
+				}
+				Some(InputAction::Redraw)
+			}
+			KeyCode::Char(c)
+				if matches!(
+					self.bottom_msg,
+					BottomMessage::Input(InputCommand::MarkJump)
+				) =>
+			{
+				self.set_msg(MessageSetting::Pop);
+				if let Some(target) = self.state.get_mark(c) {
+					return self.jump_with_history(target);
+				}
+				self.set_msg(MessageSetting::Some(BottomMessage::Error(format!(
+					"Mark '{c}' is not set"
+				))));
+				Some(InputAction::Redraw)
+			}
+			KeyCode::Char('j') if ctrl => self.submit_inputbar(),
+			KeyCode::Enter => self.submit_inputbar(),
+			KeyCode::Char(c) if !ctrl => {
+				if let BottomMessage::Input(
+					InputCommand::Search {
+						term: ref mut s, ..
+					}
+					| InputCommand::Command(ref mut s)
+				) = self.bottom_msg
+				{
+					s.push(c);
+				}
+				Some(InputAction::Redraw)
+			}
+			_ => None
+		}
+	}
+
+	fn submit_inputbar(&mut self) -> Option<InputAction> {
+		let mut default = BottomMessage::default();
+		std::mem::swap(&mut self.bottom_msg, &mut default);
+		let BottomMessage::Input(cmd) = default else {
+			std::mem::swap(&mut self.bottom_msg, &mut default);
+			return None;
+		};
+
+		match cmd {
+			InputCommand::Search { term, backward } => {
+				self.search_backward = backward;
+				if !term.is_empty() {
+					self.last_search_term.clone_from(&term);
+					self.set_msg(MessageSetting::Some(BottomMessage::SearchResults(
+						term.clone()
+					)));
+				} else {
+					self.set_msg(MessageSetting::Reset);
+				}
+
+				for img in &mut self.rendered {
+					img.num_results = None;
+				}
+				Some(InputAction::Search(term))
+			}
+			InputCommand::Command(cmd_str) => self.execute_colon_command(&cmd_str),
+			InputCommand::MarkSet | InputCommand::MarkJump => Some(InputAction::Redraw)
+		}
+	}
+
 	#[expect(clippy::unnecessary_wraps)]
 	fn update_zoom(&mut self, f: impl FnOnce(&mut Zoom)) -> Option<InputAction> {
 		if let Some(z) = &mut self.zoom {
 			f(z);
 		}
 		self.last_render.rect = Rect::default();
+		self.save_state();
 		Some(InputAction::Redraw)
 	}
 
@@ -1029,7 +2545,6 @@ impl Tui {
 
 	fn set_page(&mut self, page: usize) {
 		if page != self.page {
-			// mark that we need to re-render the images
 			self.last_render.rect = Rect::default();
 			self.page = page;
 			if let Some(zoom) = &mut self.zoom {
@@ -1040,8 +2555,6 @@ impl Tui {
 		}
 	}
 
-	// We have `msg` as optional so that if they reset it to none, it'll replace it with
-	// `prev_msg`, but if they reset it to something else, it'll put the current thing in prev_msg
 	pub fn set_msg(&mut self, msg: MessageSetting) {
 		match msg {
 			MessageSetting::Some(mut msg) => {
@@ -1054,29 +2567,185 @@ impl Tui {
 				self.bottom_msg = BottomMessage::default();
 			}
 			MessageSetting::Pop =>
-				if self.showing_help_msg {
+				if !matches!(self.overlay, Overlay::None) {
 					self.last_render.rect = Rect::default();
-					self.showing_help_msg = false;
+					self.overlay = Overlay::None;
 				} else {
 					self.bottom_msg = self.prev_msg.take().unwrap_or_default();
 				},
 		}
 	}
 
-	pub fn render_help_msg(&self, frame: &mut Frame<'_>) {
-		let frame_area = frame.area();
-		frame.render_widget(Clear, frame_area);
+	fn centered_modal(frame: &mut Frame<'_>, title: &str, w_pct: u16, h_pct: u16) -> Rect {
+		let area = frame.area();
+		frame.render_widget(Clear, area);
+		let v_layout = Layout::vertical([
+			Constraint::Percentage((100 - h_pct) / 2),
+			Constraint::Percentage(h_pct),
+			Constraint::Percentage((100 - h_pct) / 2)
+		])
+		.split(area);
+		let h_layout = Layout::horizontal([
+			Constraint::Percentage((100 - w_pct) / 2),
+			Constraint::Percentage(w_pct),
+			Constraint::Percentage((100 - w_pct) / 2)
+		])
+		.split(v_layout[1]);
 
 		let block = Block::new()
-			.title("Help")
+			.title(format!(" {title} "))
 			.padding(Padding::proportional(1))
 			.borders(Borders::ALL)
 			.border_set(border::ROUNDED)
 			.border_style(Color::Blue);
+		let inner = block.inner(h_layout[1]);
+		frame.render_widget(block, h_layout[1]);
+		inner
+	}
 
+	fn render_toc_overlay(&self, frame: &mut Frame<'_>) {
+		let inner = Self::centered_modal(
+			frame,
+			"Index / TOC (Tab/Esc: close | j/k: move | h/l/zc/zo: fold | Enter/Space: jump)",
+			80,
+			80
+		);
+		let visible_h = usize::from(inner.height.max(1));
+		let start = self.toc.cursor.saturating_sub(visible_h / 2);
+		let lines = self
+			.toc
+			.flat
+			.iter()
+			.enumerate()
+			.skip(start)
+			.take(visible_h)
+			.map(|(idx, item)| {
+				let indent = "  ".repeat(item.depth);
+				let fold_icon = if item.has_children {
+					if item.expanded { "▾ " } else { "▸ " }
+				} else {
+					"  "
+				};
+				let page_str = item
+					.page
+					.map_or_else(String::new, |p| format!(" (p.{})", p + 1));
+				let text = format!("{indent}{fold_icon}{}{page_str}", item.title);
+				if idx == self.toc.cursor {
+					Line::from(Span::styled(
+						text,
+						Style::new()
+							.fg(Color::Black)
+							.bg(Color::Cyan)
+							.add_modifier(Modifier::BOLD)
+					))
+				} else {
+					Line::from(Span::raw(text))
+				}
+			})
+			.collect::<Vec<_>>();
+
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
+	fn render_info_overlay(&self, frame: &mut Frame<'_>) {
+		let inner = Self::centered_modal(frame, "Document Information (Esc/q: close)", 75, 70);
+		let mut lines = self
+			.doc_info
+			.iter()
+			.map(|(k, v)| {
+				Line::from(vec![
+					Span::styled(
+						format!("{k:<14}: "),
+						Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+					),
+					Span::raw(v.as_str()),
+				])
+			})
+			.collect::<Vec<_>>();
+
+		lines.push(Line::from(""));
+		lines.push(Line::from(Span::styled(
+			format!(
+				"Marks saved   : {}   |   Bookmarks saved: {}",
+				self.state.marks.len(),
+				self.state.bookmarks.len()
+			),
+			Style::new().fg(Color::Yellow)
+		)));
+
+		frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+	}
+
+	fn render_visual_overlay(frame: &mut Frame<'_>, vs: &VisualTextState) {
+		let title = format!(
+			"Visual Mode - Page {} (j/k: move | v/V: select | o: swap | y/Y: yank | Esc: exit)",
+			vs.page + 1
+		);
+		let inner = Self::centered_modal(frame, &title, 85, 85);
+		let visible_h = usize::from(inner.height.max(1));
+		let start = vs.cursor.saturating_sub(visible_h / 2);
+		let (sel_start, sel_end) = vs.selected_range();
+
+		let lines = vs
+			.lines
+			.iter()
+			.enumerate()
+			.skip(start)
+			.take(visible_h)
+			.map(|(idx, line)| {
+				let text = format!("{:>4} │ {line}", idx + 1);
+				let is_cursor = idx == vs.cursor;
+				let is_selected = vs.anchor.is_some() && idx >= sel_start && idx <= sel_end;
+				let style = if is_cursor {
+					Style::new()
+						.fg(Color::Black)
+						.bg(Color::Cyan)
+						.add_modifier(Modifier::BOLD)
+				} else if is_selected {
+					Style::new().fg(Color::Black).bg(Color::Yellow)
+				} else {
+					Style::default()
+				};
+				Line::from(Span::styled(text, style))
+			})
+			.collect::<Vec<_>>();
+
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
+	fn render_picker_overlay(frame: &mut Frame<'_>, picker: &ListPickerState) {
+		let inner = Self::centered_modal(frame, &picker.title, 75, 65);
+		let visible_h = usize::from(inner.height.max(1));
+		let start = picker.cursor.saturating_sub(visible_h / 2);
+
+		let lines = picker
+			.items
+			.iter()
+			.enumerate()
+			.skip(start)
+			.take(visible_h)
+			.map(|(idx, item)| {
+				if idx == picker.cursor {
+					Line::from(Span::styled(
+						item.label.clone(),
+						Style::new()
+							.fg(Color::Black)
+							.bg(Color::Cyan)
+							.add_modifier(Modifier::BOLD)
+					))
+				} else {
+					Line::from(Span::raw(item.label.clone()))
+				}
+			})
+			.collect::<Vec<_>>();
+
+		frame.render_widget(Paragraph::new(lines), inner);
+	}
+
+	pub fn render_help_msg(&self, frame: &mut Frame<'_>) {
+		let inner = Self::centered_modal(frame, "Zathura Keybindings Help (Esc/F1: close)", 85, 88);
 		let help_sections = [
 			Text::from(HELP_PAGE),
-			// just some spacing
 			Text::from(""),
 			if self.is_kitty {
 				Text::from(KITTY_HELP)
@@ -1086,84 +2755,53 @@ impl Tui {
 			}
 		];
 
-		let max_w: u16 = help_sections
-			.iter()
-			.flat_map(|section| section.lines.as_slice())
-			// We don't really need full unicode-width since we're using all ascii for the help
-			// pages, but this is the function they give us.
-			.map(Line::width)
-			.max()
-			.unwrap_or_default()
-			.try_into()
-			.expect("Every help text line must be shorter than u16::MAX");
-
-		let layout = Layout::horizontal([
-			Constraint::Fill(1),
-			Constraint::Length(max_w + 6),
-			Constraint::Fill(1)
-		])
-		.split(frame_area);
-
-		let block_area = Layout::vertical([
-			Constraint::Fill(1),
-			Constraint::Length(
-				u16::try_from(help_sections.iter().map(|s| s.lines.len()).sum::<usize>()).unwrap()
-					+ 4
-			),
-			Constraint::Fill(1)
-		])
-		.split(layout[1]);
-
-		let mut block_inner = block.inner(block_area[1]);
-
-		frame.render_widget(block, block_area[1]);
-
+		let mut area = inner;
 		for section in help_sections {
 			let section_lines = section.lines.len();
 			let span = Paragraph::new(section).wrap(Wrap { trim: false });
-			frame.render_widget(span, block_inner);
-			block_inner.y += u16::try_from(section_lines).unwrap();
+			frame.render_widget(span, area);
+			let step = u16::try_from(section_lines).unwrap_or(0);
+			area.y = area.y.saturating_add(step);
+			area.height = area.height.saturating_sub(step);
 		}
 	}
 }
 
 static HELP_PAGE: &str = "\
-L, H, left, right:
-    Go forward/backwards a single page
-J, K, down, up:
-    Go forwards/backwards a screen's worth of pages
-q, esc:
-    Quit
-g:
-    Go to specific page (type numbers after 'g')
-/:
-    Search
-n, N:
-    Next/Previous search result
-i:
-    Invert colors
-f:
-    Remove borders/fullscreen
-?:
-    Show this page
-ctrl+z:
-    Suspend & background tdf \
+Navigation & Marks (Zathura):
+  J / K, PgDn / PgUp   : Next / Previous page (supports [count])
+  h / j / k / l        : Scroll left / down / up / right
+  Ctrl+d / Ctrl+u      : Scroll half page down / up
+  Ctrl+f / Ctrl+b, Spc : Scroll full screen down / up
+  H / L, P             : Scroll to page top / bottom, Snap to page (P)
+  gg / G, [N]gg / [N]G : First / Last page, or jump to page N
+  m<char> / '<char>    : Set quickmark / Jump to quickmark
+  Ctrl+o / Ctrl+i      : Jumplist backward / forward
+  Ctrl+j / Ctrl+k      : Bisect forward / backward
+
+Index (TOC), Links & Visual Mode:
+  Tab                  : Toggle Index (j/k, h/l/zc/zo/zM/zR, Enter/Space)
+  f / F / c            : Follow link / Display link / Copy link
+  v / V, gv            : Visual mode (j/k, v/V select, o swap, y/Y yank)
+  Y                    : Copy opened file path to clipboard
+
+Display, Search & Command Bar:
+  d / D / w            : Toggle dual-page / Cycle first-page col / Single-page
+  r / R / Ctrl+r       : Rotate 90° CW / Reload / Toggle invert colors
+  F5 / F11 / Ctrl+n    : Toggle fullscreen / statusbar
+  / / ?, n / N         : Search forward / backward, Next / Prev match
+  Esc / Ctrl+c         : Abort input / Clear search highlight
+  q                    : Quit tdf
+  :                    : Command bar (:bmark, :bjump, :blist, :bdel, :jumplist,
+                         :offset, :mark, :delmarks, :nohl, :info, :help, :q)\
 ";
 
 static KITTY_HELP: &str = "\
-When using Kitty Protocol:
-z:
-    Toggle between fill-screen and fit-screen
-o/O (when on fill-screen):
-    Zoom in and out, respectively
-gg/G (when on fill-screen):
-    Scroll to top/bottom of page
-h, j, k, l (when zoomed in):
-    Pan direction around page
-0/$ (when on fill-screen):
-    Scroll to left/right side of page
-r:
-		Rotate by 90 degrees
+Zoom & Adjust (Zathura):
+  a / s                : Adjust best-fit (a) / Adjust width (s)
+  zi, zI, +            : Zoom in
+  zo, zO, -            : Zoom out
+  z0, zz, zZ, =        : Reset zoom to original\
 ";
 
 pub enum InputAction {
@@ -1173,8 +2811,10 @@ pub enum InputAction {
 	QuitApp,
 	Invert,
 	Rotate,
+	Reload,
 	Fullscreen,
-	SwitchRenderZoom(crate::FitOrFill)
+	SwitchRenderZoom(crate::FitOrFill),
+	ExtractPageText { page: usize, open_visual: bool }
 }
 
 #[derive(Copy, Clone)]
@@ -1194,4 +2834,153 @@ pub enum MessageSetting {
 	Default,
 	Reset,
 	Pop
+}
+
+#[cfg(test)]
+mod tests {
+	use std::num::NonZeroU32;
+
+	use super::*;
+
+	#[test]
+	fn render_zoomed_handles_pane_growth_and_zero_area_without_panic() {
+		let mut img = MaybeTransferred::Transferred(NonZeroU32::new(1).unwrap());
+		let mut zoom = Zoom {
+			level: -6,
+			cell_pan_from_left: 0,
+			cell_pan_from_top: 0,
+			max_pan_top: u16::MAX
+		};
+		let font = FontSize {
+			width: 14,
+			height: 28
+		};
+
+		let res = Tui::render_zoomed(
+			Rect::new(2, 4, 150, 29),
+			font,
+			&mut zoom,
+			&mut img,
+			0,
+			(72, 28),
+			(72 * 14, 28 * 28)
+		);
+		assert!(matches!(res, KittyDisplay::DisplayImages(_)));
+
+		let zero_res = Tui::render_zoomed(
+			Rect::new(0, 0, 0, 0),
+			font,
+			&mut zoom,
+			&mut img,
+			0,
+			(72, 28),
+			(72 * 14, 28 * 28)
+		);
+		assert!(matches!(zero_res, KittyDisplay::ClearImages));
+	}
+
+	#[test]
+	fn render_zoomed_uses_exact_pixel_width_without_cropping() {
+		let mut img = MaybeTransferred::Transferred(NonZeroU32::new(1).unwrap());
+		let mut zoom = Zoom {
+			level: -7,
+			cell_pan_from_left: 0,
+			cell_pan_from_top: 0,
+			max_pan_top: u16::MAX
+		};
+		let font = FontSize {
+			width: 12,
+			height: 25
+		};
+
+		// Exact 91x37 pane -> page area 87x29; rendered at matching 12x25 cell size -> 1044x1429 px.
+		let res = Tui::render_zoomed(
+			Rect::new(2, 4, 87, 29),
+			font,
+			&mut zoom,
+			&mut img,
+			659,
+			(87, 57),
+			(1044, 1429)
+		);
+		let KittyDisplay::DisplayImages(imgs) = res else {
+			panic!("expected DisplayImages");
+		};
+		assert_eq!(imgs[0].display_loc.width, 1044);
+		assert_eq!(imgs[0].display_loc.columns, 61);
+		assert_eq!(imgs[0].display_loc.rows, 29);
+
+		// Non-multiple-of-cell-size landscape image (e.g. 1800x1013) must preserve full width & exact aspect.
+		let mut zoom0 = Zoom::default();
+		let res_landscape = Tui::render_zoomed(
+			Rect::new(2, 4, 150, 29),
+			font,
+			&mut zoom0,
+			&mut img,
+			0,
+			(150, 40),
+			(1800, 1013)
+		);
+		let KittyDisplay::DisplayImages(imgs_l) = res_landscape else {
+			panic!("expected DisplayImages");
+		};
+		assert_eq!(imgs_l[0].display_loc.width, 1800);
+		assert_eq!(imgs_l[0].display_loc.height, 725);
+
+		let mut zoom_out = Zoom {
+			level: -7,
+			..Zoom::default()
+		};
+		let res_landscape_out = Tui::render_zoomed(
+			Rect::new(2, 4, 150, 29),
+			font,
+			&mut zoom_out,
+			&mut img,
+			0,
+			(150, 40),
+			(1800, 1013)
+		);
+		let KittyDisplay::DisplayImages(imgs_lo) = res_landscape_out else {
+			panic!("expected DisplayImages");
+		};
+		assert_eq!(imgs_lo[0].display_loc.columns, 107);
+		assert_eq!(imgs_lo[0].display_loc.rows, 29);
+		assert_eq!(imgs_lo[0].display_loc.width, 1794);
+		assert_eq!(imgs_lo[0].display_loc.height, 1013);
+	}
+
+	#[test]
+	fn render_skips_stale_vertically_oversized_fit_page() {
+		use ratatui::{Terminal, backend::TestBackend};
+
+		let mut term = Terminal::new(TestBackend::new(91, 18)).unwrap();
+		let mut tui = Tui::new(
+			"test.pdf".to_string(),
+			PathBuf::from("/tmp/nonexistent-tdf-test.pdf"),
+			None,
+			false,
+			true
+		);
+		tui.zoom = None;
+		tui.set_n_pages(1);
+		tui.rendered[0].img = Some(ConvertedImage::Kitty {
+			img: MaybeTransferred::Transferred(NonZeroU32::new(1).unwrap()),
+			cell_w: 44,
+			cell_h: 29,
+			px_w: 528,
+			px_h: 725
+		});
+
+		let mut display = KittyDisplay::NoChange;
+		term.draw(|f| {
+			let layout = Tui::main_layout(f, false);
+			display = tui.render(f, &layout, FontSize {
+				width: 12,
+				height: 25
+			});
+		})
+		.unwrap();
+
+		assert!(matches!(display, KittyDisplay::ClearImages));
+	}
 }

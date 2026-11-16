@@ -1,13 +1,23 @@
-use std::{collections::VecDeque, num::NonZeroUsize, path::Path, thread::sleep, time::Duration};
+use std::{
+	collections::VecDeque,
+	num::NonZeroUsize,
+	panic::{AssertUnwindSafe, catch_unwind},
+	path::Path,
+	thread::sleep,
+	time::Duration
+};
 
 use flume::{Receiver, SendError, Sender, TryRecvError};
 use mupdf::{
-	Colorspace, Document, Matrix, Page, Pixmap, Quad, TextPageFlags, text_page::SearchHitResponse
+	Colorspace, Document, Matrix, MetadataName, Outline, Page, Pixmap, Quad, TextPageFlags,
+	text_page::SearchHitResponse
 };
 use ratatui::layout::Rect;
 
 use crate::{
-	FitOrFill, PrerenderLimit, ScaledResult, scale_img_for_area, skip::InterleavedAroundWithMax
+	FitOrFill, PrerenderLimit, ScaledResult, scale_img_for_area,
+	skip::InterleavedAroundWithMax,
+	zathura::{PageLink, TocNode}
 };
 
 const KITTY_MAX_W_OR_H: f32 = 10_000.0;
@@ -17,11 +27,14 @@ pub enum RenderNotif {
 	Area(Rect),
 	JumpToPage(usize),
 	PageNeedsReRender(usize),
+	PageDropped(usize),
 	Search(String),
 	SwitchFitOrFill(FitOrFill),
 	Reload,
 	Invert,
-	Rotate
+	Rotate,
+	SetState { invert: bool, rotate_steps: u8 },
+	ExtractPageText { page: usize, open_visual: bool }
 }
 
 #[derive(Debug)]
@@ -35,7 +48,20 @@ pub enum RenderInfo {
 	NumPages(usize),
 	Page(PageInfo),
 	SearchResults { page_num: usize, num_results: usize },
-	Reloaded
+	Reloaded,
+	DocMetadata {
+		outlines: Vec<TocNode>,
+		info: Vec<(String, String)>
+	},
+	PageLinks {
+		page_num: usize,
+		links: Vec<PageLink>
+	},
+	PageText {
+		page_num: usize,
+		text: String,
+		open_visual: bool
+	}
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -96,7 +122,11 @@ pub fn start_rendering(
 	col_w: u16,
 	prerender: PrerenderLimit,
 	black: i32,
-	white: i32
+	white: i32,
+	initial_page: usize,
+	initial_invert: bool,
+	initial_rotate_steps: u8,
+	initial_fit_or_fill: FitOrFill
 ) -> Result<(), SendError<Result<RenderInfo, RenderError>>> {
 	// We want this outside of 'reload so that if the doc reloads, the search term that somebody
 	// set will still get highlighted in the reloaded doc
@@ -106,10 +136,16 @@ pub fn start_rendering(
 	// now, so we just use the values passed in.
 
 	let mut stored_doc = None;
-	let mut invert = false;
-	let mut rotate = RotateDirection::Deg0;
+	let mut invert = initial_invert;
+	let mut rotate = match initial_rotate_steps % 4 {
+		1 => RotateDirection::Deg90,
+		2 => RotateDirection::Deg180,
+		3 => RotateDirection::Deg270,
+		_ => RotateDirection::Deg0
+	};
 	let mut preserved_area = None;
-	let mut fit_or_fill = FitOrFill::Fit;
+	let mut fit_or_fill = initial_fit_or_fill;
+	let mut start_point = initial_page;
 
 	let mut need_rerender = VecDeque::new();
 
@@ -168,6 +204,8 @@ pub fn start_rendering(
 		};
 
 		sender.send(Ok(RenderInfo::NumPages(n_pages.get())))?;
+		let (outlines, info) = extract_doc_metadata(doc, path, n_pages.get());
+		sender.send(Ok(RenderInfo::DocMetadata { outlines, info }))?;
 
 		// We're using this vec to indicate which page numbers have already been rendered, to
 		// support people jumping to specific pages and having quick rendering results. We
@@ -176,7 +214,7 @@ pub fn start_rendering(
 		// then we can split at that page and render at both sides of it
 		let mut rendered = Vec::new();
 		fill_default::<PrevRender>(&mut rendered, n_pages.get());
-		let mut start_point = 0;
+		start_point = start_point.min(n_pages.get() - 1);
 
 		// This is kinda a weird way of doing this, but if we get a notification that the area
 		// changed, we want to start re-rending all of the pages, but we don't want to reload the
@@ -227,9 +265,16 @@ pub fn start_rendering(
 							continue 'render_pages;
 						}
 						RenderNotif::PageNeedsReRender(page) => {
-							rendered[page].successful = false;
-							need_rerender.push_back(page);
+							if let Some(slot) = rendered.get_mut(page) {
+								slot.successful = false;
+								need_rerender.push_back(page);
+							}
 							continue 'render_pages;
+						}
+						RenderNotif::PageDropped(page) => {
+							if let Some(slot) = rendered.get_mut(page) {
+								slot.successful = false;
+							}
 						}
 						RenderNotif::Search(term) => {
 							if term.is_empty() {
@@ -266,6 +311,39 @@ pub fn start_rendering(
 								page.successful = false;
 							}
 							continue 'render_pages;
+						}
+						RenderNotif::SetState {
+							invert: new_invert,
+							rotate_steps
+						} => {
+							let new_rot = match rotate_steps % 4 {
+								1 => RotateDirection::Deg90,
+								2 => RotateDirection::Deg180,
+								3 => RotateDirection::Deg270,
+								_ => RotateDirection::Deg0
+							};
+							invert = new_invert;
+							rotate = new_rot;
+							for page in &mut rendered {
+								page.successful = false;
+							}
+							continue 'render_pages;
+						}
+						RenderNotif::ExtractPageText {
+							page: p_idx,
+							open_visual
+						} => {
+							if let Ok(loaded_page) = doc.load_page(p_idx as i32) {
+								let text = loaded_page
+									.to_text_page(TextPageFlags::empty())
+									.and_then(|tp| tp.to_text())
+									.unwrap_or_default();
+								sender.send(Ok(RenderInfo::PageText {
+									page_num: p_idx,
+									text,
+									open_visual
+								}))?;
+							}
 						}
 					}
 				}};
@@ -349,6 +427,11 @@ pub fn start_rendering(
 
 						rendered.num_search_found = Some(ctx.result_rects.len());
 						rendered.successful = true;
+
+						let links = extract_page_links(&page, page_num);
+						if !links.is_empty() {
+							sender.send(Ok(RenderInfo::PageLinks { page_num, links }))?;
+						}
 
 						sender.send(Ok(RenderInfo::Page(PageInfo {
 							img_data: ImageData {
@@ -624,4 +707,72 @@ impl ExactSizeIterator for PopOnNext<'_> {
 	fn len(&self) -> usize {
 		self.inner.len()
 	}
+}
+
+fn convert_outline_nodes(outlines: Vec<Outline>) -> Vec<TocNode> {
+	outlines
+		.into_iter()
+		.map(|o| TocNode {
+			title: o.title,
+			page: o.dest.map(|d| d.loc.page_number as usize),
+			uri: o.uri,
+			children: convert_outline_nodes(o.down),
+			expanded: true
+		})
+		.collect()
+}
+
+fn extract_doc_metadata(
+	doc: &Document,
+	path: &Path,
+	n_pages: usize
+) -> (Vec<TocNode>, Vec<(String, String)>) {
+	let outlines = catch_unwind(AssertUnwindSafe(|| doc.outlines()))
+		.ok()
+		.and_then(Result::ok)
+		.map_or_else(Vec::new, convert_outline_nodes);
+
+	let mut info = vec![
+		("File".to_string(), path.to_string_lossy().to_string()),
+		("Pages".to_string(), n_pages.to_string()),
+	];
+
+	for (label, key) in [
+		("Title", MetadataName::Title),
+		("Author", MetadataName::Author),
+		("Subject", MetadataName::Subject),
+		("Keywords", MetadataName::Keywords),
+		("Creator", MetadataName::Creator),
+		("Producer", MetadataName::Producer),
+		("Created", MetadataName::CreationDate),
+		("Modified", MetadataName::ModDate),
+		("Format", MetadataName::Format),
+		("Encryption", MetadataName::Encryption)
+	] {
+		if let Ok(val) = doc.metadata(key)
+			&& !val.trim().is_empty()
+		{
+			info.push((label.to_string(), val));
+		}
+	}
+
+	(outlines, info)
+}
+
+fn extract_page_links(page: &Page, page_num: usize) -> Vec<PageLink> {
+	catch_unwind(AssertUnwindSafe(|| {
+		page.links()
+			.map_or_else(
+				|_| Vec::new(),
+				|iter| {
+					iter.map(|l| PageLink {
+						page: page_num,
+						dest_page: l.dest.map(|d| d.loc.page_number as usize),
+						uri: l.uri
+					})
+					.collect()
+				}
+			)
+	}))
+	.unwrap_or_default()
 }
